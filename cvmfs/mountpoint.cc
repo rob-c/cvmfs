@@ -1032,6 +1032,13 @@ void FileSystem::SetupSqlite() {
   assert(retval == SQLITE_OK);
   retval = sqlite3_config(SQLITE_CONFIG_MULTITHREAD);
   assert(retval == SQLITE_OK);
+  // SQLite serialises calls into a custom allocator (SqliteMemoryManager has
+  // no lock of its own) only while memory statistics are enabled.  That is
+  // the compile-time default for the bundled SQLite but not for every system
+  // library (macOS ships SQLITE_DEFAULT_MEMSTATUS=0), where concurrent catalog
+  // lookups then corrupt the allocator's arena.
+  retval = sqlite3_config(SQLITE_CONFIG_MEMSTATUS, 1);
+  assert(retval == SQLITE_OK);
   SqliteMemoryManager::GetInstance()->AssignGlobalArenas();
 
   // Disable SQlite3 file locking
@@ -2353,6 +2360,10 @@ void MountPoint::SetupHttpTuning() {
 
   if (options_mgr_->GetValue("CVMFS_LOW_SPEED_LIMIT", &optarg))
     download_mgr_->SetLowSpeedLimit(String2Uint64(optarg));
+  if (options_mgr_->GetValue("CVMFS_TCP_KEEPALIVE", &optarg))
+    download_mgr_->SetTcpKeepalive(String2Uint64(optarg));
+  if (options_mgr_->GetValue("CVMFS_PARALLEL_FETCH", &optarg))
+    download_mgr_->SetParallelFetch(String2Uint64(optarg));
   if (options_mgr_->GetValue("CVMFS_PROXY_RESET_AFTER", &optarg)) {
     download_mgr_->SetProxyGroupResetDelay(String2Uint64(optarg));
     // Use the proxy reset delay as the default for the metalink reset delay

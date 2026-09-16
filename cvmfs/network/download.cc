@@ -160,6 +160,18 @@ static size_t CallbackCurlHeader(void *ptr, size_t size, size_t nmemb,
     }
 
     if ((info->http_code() / 100) == 2) {
+      if ((info->resume_offset() > 0) && (info->http_code() != 206)) {
+        // Resuming, but the server ignored the Range header.  Abort before
+        // any body byte is delivered and let the retry start from scratch.
+        LogCvmfs(kLogDownload, kLogDebug,
+                 "(id %" PRId64 ") server ignored resume range, restarting",
+                 info->id());
+        info->SetResumeOffset(0);
+        info->SetErrorCode((info->proxy() == "DIRECT")
+                               ? kFailHostShortTransfer
+                               : kFailProxyShortTransfer);
+        return 0;
+      }
       return num_bytes;
     } else if ((info->http_code() == 301) || (info->http_code() == 302)
                || (info->http_code() == 303) || (info->http_code() == 307)) {
@@ -196,12 +208,14 @@ static size_t CallbackCurlHeader(void *ptr, size_t size, size_t nmemb,
   }
 
   // If needed: allocate space in sink
-  if (info->sink() != NULL && info->sink()->RequiresReserve()
-      && HasPrefix(header_line, "CONTENT-LENGTH:", true)) {
+  if (HasPrefix(header_line, "CONTENT-LENGTH:", true)) {
     char *tmp = reinterpret_cast<char *>(alloca(num_bytes + 1));
     uint64_t length = 0;
     sscanf(header_line.c_str(), "%s %" PRIu64, tmp, &length);
-    if (length > 0) {
+    info->SetContentLength(static_cast<int64_t>(length));
+    if (info->sink() == NULL || !info->sink()->RequiresReserve()) {
+      // nothing to reserve
+    } else if (length > 0) {
       if (!info->sink()->Reserve(length)) {
         LogCvmfs(kLogDownload, kLogDebug | kLogSyslogErr,
                  "(id %" PRId64 ") "
@@ -453,6 +467,18 @@ int DownloadManager::ParseHttpCode(const char digits[3]) {
 /**
  * Called when new curl sockets arrive or existing curl sockets depart.
  */
+/**
+ * libcurl tells us when it next needs curl_multi_socket_action(); MainDownload
+ * uses this as its poll timeout instead of waking up every millisecond.
+ */
+int DownloadManager::CallbackCurlTimer(CURLM * /* multi */, long timeout_ms,
+                                       void *userp) {
+  DownloadManager *download_mgr = static_cast<DownloadManager *>(userp);
+  download_mgr->curl_timeout_ms_ = timeout_ms;
+  return 0;
+}
+
+
 int DownloadManager::CallbackCurlSocket(CURL * /* easy */,
                                         curl_socket_t s,
                                         int action,
@@ -557,6 +583,9 @@ void *DownloadManager::MainDownload(void *data) {
   int still_running = 0;
   struct timeval timeval_start, timeval_stop;
   gettimeofday(&timeval_start, NULL);
+  // Retries waiting for their backoff to expire (see Backoff())
+  std::vector<JobInfo *> deferred;
+
   while (true) {
     int timeout;
     if (still_running) {
@@ -569,7 +598,12 @@ void *DownloadManager::MainDownload(void *data) {
       // timeout.  TODO(bbockelm) we should switch to that in the future.
       timeout = 100;
       */
-      timeout = 1;
+      // Wake up when libcurl asked for it (timer callback), at most every
+      // 100 ms as a safety net, instead of spinning with a 1 ms timeout.
+      const long curl_timeout = download_mgr->curl_timeout_ms_;  // NOLINT
+      timeout = ((curl_timeout >= 0) && (curl_timeout < 100))
+                    ? static_cast<int>(curl_timeout)
+                    : 100;
     } else {
       timeout = -1;
       gettimeofday(&timeval_stop, NULL);
@@ -577,10 +611,39 @@ void *DownloadManager::MainDownload(void *data) {
           1000 * DiffTimeSeconds(timeval_start, timeval_stop));
       perf::Xadd(download_mgr->counters_->sz_transfer_time, delta);
     }
+    if (!deferred.empty()) {
+      const uint64_t now_ms = platform_monotonic_time_ns() / 1000000;
+      uint64_t next_ms = deferred[0]->retry_not_before_ms();
+      for (unsigned i = 1; i < deferred.size(); ++i)
+        next_ms = std::min(next_ms, deferred[i]->retry_not_before_ms());
+      const int wait_ms = (next_ms > now_ms)
+                              ? static_cast<int>(next_ms - now_ms)
+                              : 0;
+      if ((timeout < 0) || (wait_ms < timeout))
+        timeout = wait_ms;
+    }
     const int retval = poll(download_mgr->watch_fds_,
                             download_mgr->watch_fds_inuse_, timeout);
     if (retval < 0) {
       continue;
+    }
+
+    // Re-issue retries whose backoff has expired
+    if (!deferred.empty()) {
+      const uint64_t now_ms = platform_monotonic_time_ns() / 1000000;
+      for (unsigned i = 0; i < deferred.size();) {
+        if (deferred[i]->retry_not_before_ms() <= now_ms) {
+          JobInfo *info = deferred[i];
+          info->SetRetryNotBeforeMs(0);
+          deferred.erase(deferred.begin() + i);
+          curl_multi_add_handle(download_mgr->curl_multi_,
+                                info->curl_handle());
+          curl_multi_socket_action(download_mgr->curl_multi_,
+                                   CURL_SOCKET_TIMEOUT, 0, &still_running);
+        } else {
+          ++i;
+        }
+      }
     }
 
     // Handle timeout
@@ -658,11 +721,15 @@ void *DownloadManager::MainDownload(void *data) {
 
         curl_multi_remove_handle(download_mgr->curl_multi_, easy_handle);
         if (download_mgr->VerifyAndFinalize(curl_error, info)) {
-          curl_multi_add_handle(download_mgr->curl_multi_, easy_handle);
-          curl_multi_socket_action(download_mgr->curl_multi_,
-                                   CURL_SOCKET_TIMEOUT,
-                                   0,
-                                   &still_running);
+          if (info->retry_not_before_ms() > 0) {
+            deferred.push_back(info);
+          } else {
+            curl_multi_add_handle(download_mgr->curl_multi_, easy_handle);
+            curl_multi_socket_action(download_mgr->curl_multi_,
+                                     CURL_SOCKET_TIMEOUT,
+                                     0,
+                                     &still_running);
+          }
         } else {
           // Return easy handle into pool and write result back
           download_mgr->ReleaseCurlHandle(easy_handle, true /* allow_reuse */);
@@ -675,6 +742,14 @@ void *DownloadManager::MainDownload(void *data) {
       }
     }
   }
+
+  for (unsigned i = 0; i < deferred.size(); ++i) {
+    JobInfo *info = deferred[i];
+    info->SetErrorCode(kFailOther);
+    info->GetDataTubePtr()->EnqueueBack(new DataTubeElement(kActionStop));
+    info->GetPipeJobResultPtr()->Write<download::Failures>(info->error_code());
+  }
+  deferred.clear();
 
   for (set<CURL *>::iterator i = download_mgr->pool_handles_inuse_->begin(),
                              iEnd = download_mgr->pool_handles_inuse_->end();
@@ -879,6 +954,43 @@ void DownloadManager::ReleaseCurlHandle(CURL *handle, bool allow_reuse) {
 
 
 /**
+ * A short transfer is resumed rather than restarted if at least this many
+ * bytes arrived, and such a resume does not count against the retry budget.
+ */
+static const curl_off_t kMinResumeProgress = 8 * 1024;
+
+/**
+ * Byte range of the request: the caller's range (external files) shifted by
+ * the bytes already received in earlier attempts of the same transfer.
+ */
+static void SetRangeOption(JobInfo *info, CURL *handle) {
+  const bool has_range = (info->range_offset() != -1) && (info->range_size());
+  if (!has_range && (info->resume_offset() == 0)) {
+    curl_easy_setopt(handle, CURLOPT_RANGE, NULL);
+    return;
+  }
+  const int64_t lower = (has_range ? static_cast<int64_t>(info->range_offset())
+                                   : 0)
+                        + static_cast<int64_t>(info->resume_offset());
+  char byte_range_array[100];
+  int len;
+  if (has_range) {
+    const int64_t upper = static_cast<int64_t>(info->range_offset()
+                                               + info->range_size() - 1);
+    len = snprintf(byte_range_array, sizeof(byte_range_array),
+                   "%" PRId64 "-%" PRId64, lower, upper);
+  } else {
+    len = snprintf(byte_range_array, sizeof(byte_range_array), "%" PRId64 "-",
+                   lower);
+  }
+  if (len >= static_cast<int>(sizeof(byte_range_array))) {
+    PANIC(NULL);  // Should be impossible given limits on offset size.
+  }
+  curl_easy_setopt(handle, CURLOPT_RANGE, byte_range_array);
+}
+
+
+/**
  * HTTP request options: set the URL and other options such as timeout and
  * proxy.
  */
@@ -927,20 +1039,8 @@ void DownloadManager::InitializeRequest(JobInfo *info, CURL *handle) {
     shash::Init(info->hash_context());
   }
 
-  if ((info->range_offset() != -1) && (info->range_size())) {
-    char byte_range_array[100];
-    const int64_t range_lower = static_cast<int64_t>(info->range_offset());
-    const int64_t range_upper = static_cast<int64_t>(info->range_offset()
-                                                     + info->range_size() - 1);
-    if (snprintf(byte_range_array, sizeof(byte_range_array),
-                 "%" PRId64 "-%" PRId64, range_lower, range_upper)
-        == 100) {
-      PANIC(NULL);  // Should be impossible given limits on offset size.
-    }
-    curl_easy_setopt(handle, CURLOPT_RANGE, byte_range_array);
-  } else {
-    curl_easy_setopt(handle, CURLOPT_RANGE, NULL);
-  }
+  info->SetResumeOffset(0);
+  SetRangeOption(info, handle);
 
   // Set curl parameters
   curl_easy_setopt(handle, CURLOPT_PRIVATE, static_cast<void *>(info));
@@ -955,6 +1055,8 @@ void DownloadManager::InitializeRequest(JobInfo *info, CURL *handle) {
   if (opt_ipv4_only_) {
     curl_easy_setopt(handle, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
   }
+  // Handles are pooled; a previous retry may have requested a fresh connection
+  curl_easy_setopt(handle, CURLOPT_FRESH_CONNECT, 0L);
   if (follow_redirects_) {
     curl_easy_setopt(handle, CURLOPT_FOLLOWLOCATION, 1);
     curl_easy_setopt(handle, CURLOPT_MAXREDIRS, 4);
@@ -1063,6 +1165,25 @@ void DownloadManager::SetUrlOptions(JobInfo *info) {
   CheckHostInfoReset("host", opt_host_, info, now);
 
   curl_easy_setopt(curl_handle, CURLOPT_LOW_SPEED_LIMIT, opt_low_speed_limit_);
+  if (opt_tcp_keepalive_ > 0) {
+    // Keep idle keep-alive connections visible to stateful middleboxes
+    // (NAT/conntrack/DPI) that silently drop flows after an idle period
+    curl_easy_setopt(curl_handle, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(curl_handle, CURLOPT_TCP_KEEPIDLE,
+                     static_cast<long>(opt_tcp_keepalive_));  // NOLINT
+    curl_easy_setopt(curl_handle, CURLOPT_TCP_KEEPINTVL,
+                     static_cast<long>(opt_tcp_keepalive_));  // NOLINT
+  } else {
+    curl_easy_setopt(curl_handle, CURLOPT_TCP_KEEPALIVE, 0L);
+  }
+  if (opt_fresh_connect_until_ > 0) {
+    if (now == 0)
+      now = time(NULL);
+    if (now < opt_fresh_connect_until_)
+      curl_easy_setopt(curl_handle, CURLOPT_FRESH_CONNECT, 1L);
+    else
+      opt_fresh_connect_until_ = 0;
+  }
   if (info->proxy() != "DIRECT") {
     curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT, opt_timeout_proxy_);
     curl_easy_setopt(curl_handle, CURLOPT_LOW_SPEED_TIME, opt_timeout_proxy_);
@@ -1279,9 +1400,27 @@ bool DownloadManager::CanRetry(const JobInfo *info) {
   const MutexLockGuard m(lock_options_);
   const unsigned max_retries = opt_max_retries_;
 
-  return !(info->nocache()) && (info->num_retries() < max_retries)
-         && (IsProxyTransferError(info->error_code())
-             || IsHostTransferError(info->error_code()));
+  const bool retryable_error = IsProxyTransferError(info->error_code())
+                               || IsHostTransferError(info->error_code())
+                               || (info->error_code() == kFailHostResolve)
+                               || (info->error_code() == kFailProxyResolve);
+  if (info->nocache() || !retryable_error)
+    return false;
+  if (info->num_retries() < max_retries)
+    return true;
+  // Beyond the retry count, keep retrying failures that are cheap: as long
+  // as the attempts without progress have not yet cost one timeout period in
+  // total, the peer is answering quickly (severed streams, not a dead host)
+  // and another attempt is worth it.  A dead peer times out on each attempt
+  // and therefore still exhausts the budget after max_retries attempts.
+  if (info->no_progress_since_ms() > 0) {
+    const uint64_t now_ms = platform_monotonic_time_ns() / 1000000;
+    const uint64_t budget_ms = 1000ULL * ((info->proxy() == "DIRECT")
+                                              ? opt_timeout_direct_
+                                              : opt_timeout_proxy_);
+    return (now_ms - info->no_progress_since_ms()) < budget_ms;
+  }
+  return false;
 }
 
 /**
@@ -1302,7 +1441,12 @@ void DownloadManager::Backoff(JobInfo *info) {
 
   info->SetNumRetries(info->num_retries() + 1);
   perf::Inc(counters_->n_retries);
-  if (info->backoff_ms() == 0) {
+  if ((info->error_code() == kFailHostShortTransfer)
+      || (info->error_code() == kFailProxyShortTransfer)) {
+    // A cut stream is a lossy link, not an overloaded server: retry promptly
+    // with a small jitter instead of the exponential backoff
+    info->SetBackoffMs(10 + prng_.Next(90));
+  } else if (info->backoff_ms() == 0) {
     info->SetBackoffMs(prng_.Next(backoff_init_ms + 1));  // Must be != 0
   } else {
     info->SetBackoffMs(info->backoff_ms() * 2);
@@ -1314,7 +1458,14 @@ void DownloadManager::Backoff(JobInfo *info) {
   LogCvmfs(kLogDownload, kLogDebug,
            "(manager '%s' - id %" PRId64 ") backing off for %d ms",
            name_.c_str(), info->id(), info->backoff_ms());
-  SafeSleepMs(info->backoff_ms());
+  if (atomic_xadd32(&multi_threaded_, 0) == 1) {
+    // Sleeping here would stall the I/O thread and with it every other
+    // transfer of this manager; MainDownload re-queues the job when due.
+    info->SetRetryNotBeforeMs(platform_monotonic_time_ns() / 1000000
+                              + info->backoff_ms());
+  } else {
+    SafeSleepMs(info->backoff_ms());
+  }
 }
 
 void DownloadManager::SetNocache(JobInfo *info) {
@@ -1505,9 +1656,23 @@ bool DownloadManager::VerifyAndFinalize(const int curl_error, JobInfo *info) {
 
       info->SetErrorCode(kFailOk);
       break;
-    case CURLE_UNSUPPORTED_PROTOCOL:
-      info->SetErrorCode(kFailUnsupportedProtocol);
+    case CURLE_UNSUPPORTED_PROTOCOL: {
+      // Also returned for a non-HTTP reply on an established connection
+      // (e.g. a middlebox injecting a plain-text block banner), which libcurl
+      // rejects as HTTP/0.9.  That is a mangled transfer, not a bad URL, so
+      // let the usual retry and proxy/host fail-over apply instead of EIO.
+      curl_off_t connect_time = 0;
+      curl_easy_getinfo(info->curl_handle(), CURLINFO_CONNECT_TIME_T,
+                        &connect_time);
+      if (connect_time > 0) {
+        info->SetErrorCode((info->proxy() == "DIRECT")
+                               ? kFailHostShortTransfer
+                               : kFailProxyShortTransfer);
+      } else {
+        info->SetErrorCode(kFailUnsupportedProtocol);
+      }
       break;
+    }
     case CURLE_URL_MALFORMAT:
       info->SetErrorCode(kFailBadUrl);
       break;
@@ -1517,10 +1682,18 @@ bool DownloadManager::VerifyAndFinalize(const int curl_error, JobInfo *info) {
     case CURLE_COULDNT_RESOLVE_HOST:
       info->SetErrorCode(kFailHostResolve);
       break;
-    case CURLE_OPERATION_TIMEDOUT:
+    case CURLE_OPERATION_TIMEDOUT: {
       info->SetErrorCode((info->proxy() == "DIRECT") ? kFailHostTooSlow
                                                      : kFailProxyTooSlow);
+      // Quarantine the connection pool for one timeout period (see
+      // opt_fresh_connect_until_)
+      const MutexLockGuard m(lock_options_);
+      opt_fresh_connect_until_ = time(NULL)
+                                 + ((info->proxy() == "DIRECT")
+                                        ? opt_timeout_direct_
+                                        : opt_timeout_proxy_);
       break;
+    }
     case CURLE_PARTIAL_FILE:
     case CURLE_GOT_NOTHING:
     case CURLE_RECV_ERROR:
@@ -1597,13 +1770,19 @@ bool DownloadManager::VerifyAndFinalize(const int curl_error, JobInfo *info) {
       if (!info->nocache()) {
         try_again = true;
       } else {
-        // Make it a host failure
+        // Make it a host failure, or a proxy failure if a proxy is in the
+        // path: with the no-cache retry also corrupt, a tampering proxy (or
+        // middlebox on the proxy path) is at least as likely as a bad host,
+        // and only a proxy switch can route around it.  If all proxies fail
+        // the same way, the regular proxy-to-host fail-over still follows.
         LogCvmfs(kLogDownload, kLogDebug | kLogSyslogWarn,
                  "(manager '%s' - id %" PRId64 ") "
                  "data corruption with no-cache header, try another %s",
-                 name_.c_str(), info->id(), typ.c_str());
+                 name_.c_str(), info->id(),
+                 (info->proxy() == "DIRECT") ? typ.c_str() : "proxy");
 
-        info->SetErrorCode(kFailHostHttp);
+        info->SetErrorCode((info->proxy() == "DIRECT") ? kFailHostHttp
+                                                       : kFailProxyHttp);
       }
     }
     if (same_url_retry
@@ -1691,8 +1870,53 @@ bool DownloadManager::VerifyAndFinalize(const int curl_error, JobInfo *info) {
     // leave the bytes of this failed attempt in the tube to be decompressed
     // into the output. Defer the reset by enqueuing an ordered marker; the
     // caller discards this attempt's bytes when it pops it (see below).
+    // Resume instead of restart: the content hash covers the bytes on the
+    // wire, and hash context, zlib stream and sink all keep their state, so a
+    // transfer that was cut or stalled after delivering data can continue
+    // with a Range request from the first missing byte.  A retry that made
+    // real progress does not consume the retry budget either, otherwise a
+    // large object could never complete on a link that drops long flows.
+    bool resume = false;
+    bool free_retry = false;
+    if (info->expected_hash() && (info->sink() != NULL)
+        && !info->sink()->RequiresReserve() && !info->nocache()
+        && (IsHostTransferError(info->error_code())
+            || IsProxyTransferError(info->error_code()))) {
+      // Bytes of this attempt count only if they came with a 2xx; an attempt
+      // that died before any body byte keeps the progress of earlier ones.
+      // The object is content-addressed, so the resume is valid on another
+      // host or proxy as well.
+      curl_off_t received = 0;
+      if ((info->http_code() / 100) == 2) {
+        curl_easy_getinfo(info->curl_handle(), CURLINFO_SIZE_DOWNLOAD_T,
+                          &received);
+      }
+      resume = (received > 0) || (info->resume_offset() > 0);
+      if (received > 0) {
+        free_retry = (received >= kMinResumeProgress);
+        if (free_retry) {
+          // Progress: the peer is alive and the retry budget starts afresh
+          info->SetNumRetries(0);
+          info->SetNoProgressSinceMs(0);
+        }
+        info->SetResumeOffset(info->resume_offset()
+                              + static_cast<uint64_t>(received));
+        LogCvmfs(kLogDownload, kLogDebug,
+                 "(manager '%s' - id %" PRId64 ") "
+                 "resuming %s at byte %" PRIu64,
+                 name_.c_str(), info->id(), info->url()->c_str(),
+                 info->resume_offset());
+      }
+    }
+    if (!resume) {
+      info->SetResumeOffset(0);
+    }
+    if (!free_retry && (info->no_progress_since_ms() == 0)) {
+      info->SetNoProgressSinceMs(platform_monotonic_time_ns() / 1000000);
+    }
+
     const bool defer_reset = info->IsValidDataTube();
-    if (!defer_reset) {
+    if (!resume && !defer_reset) {
       if (info->sink() != NULL && info->sink()->Reset() != 0) {
         info->SetErrorCode(kFailLocalIO);
         goto verify_and_finalize_stop;
@@ -1706,13 +1930,13 @@ bool DownloadManager::VerifyAndFinalize(const int curl_error, JobInfo *info) {
     // The hash context is updated on this (MainDownload) thread in
     // CallbackCurlData(), so it is reset here regardless of the decompress
     // mode.
-    if (info->expected_hash()) {
+    if (!resume && info->expected_hash()) {
       shash::Init(info->hash_context());
     }
-    if (info->compressed() && !defer_reset) {
+    if (!resume && info->compressed() && !defer_reset) {
       zlib::DecompressInit(info->GetZstreamPtr());
     }
-    if (defer_reset) {
+    if (!resume && defer_reset) {
       info->GetDataTubePtr()->EnqueueBack(new DataTubeElement(kActionReset));
     }
 
@@ -1730,10 +1954,23 @@ bool DownloadManager::VerifyAndFinalize(const int curl_error, JobInfo *info) {
           SetNocache(info);
           break;
         case kFailProxyResolve:
+          // A lost DNS packet is not a dead proxy: retry before switching
+          if (same_url_retry) {
+            Backoff(info);
+          } else {
+            switch_proxy = true;
+          }
+          break;
         case kFailProxyHttp:
           switch_proxy = true;
           break;
         case kFailHostResolve:
+          if (same_url_retry) {
+            Backoff(info);
+          } else {
+            switch_host = true;
+          }
+          break;
         case kFailHostHttp:
         case kFailHostAfterProxy:
           switch_host = true;
@@ -1741,13 +1978,15 @@ bool DownloadManager::VerifyAndFinalize(const int curl_error, JobInfo *info) {
         default:
           if (IsProxyTransferError(info->error_code())) {
             if (same_url_retry) {
-              Backoff(info);
+              if (!free_retry)
+                Backoff(info);
             } else {
               switch_proxy = true;
             }
           } else if (IsHostTransferError(info->error_code())) {
             if (same_url_retry) {
-              Backoff(info);
+              if (!free_retry)
+                Backoff(info);
             } else {
               switch_host = true;
             }
@@ -1774,6 +2013,15 @@ bool DownloadManager::VerifyAndFinalize(const int curl_error, JobInfo *info) {
         SetUrlOptions(info);
       }
     }  // end !sharding
+
+    SetRangeOption(info, info->curl_handle());
+
+    // Never retry on a pooled keep-alive connection.  A middlebox (conntrack
+    // idle timeout, DPI black hole) silently kills idle flows without a FIN or
+    // RST, so curl cannot tell that the pooled connections are dead; retrying
+    // on one of them burns another full timeout and then wrongly fails over
+    // away from a healthy proxy or host.
+    curl_easy_setopt(info->curl_handle(), CURLOPT_FRESH_CONNECT, 1L);
 
     if (failover_indefinitely_) {
       // try again, breaking if there's a cvmfs reload happening and we are in a
@@ -1898,9 +2146,13 @@ DownloadManager::DownloadManager(const unsigned max_pool_handles,
     , watch_fds_size_(0)
     , watch_fds_inuse_(0)
     , watch_fds_max_(4 * max_pool_handles)
+    , curl_timeout_ms_(-1)
     , opt_timeout_proxy_(5)
     , opt_timeout_direct_(10)
     , opt_low_speed_limit_(1024)
+    , opt_tcp_keepalive_(0)
+    , opt_parallel_fetch_(0)
+    , opt_fresh_connect_until_(0)
     , opt_max_retries_(0)
     , opt_backoff_init_ms_(0)
     , opt_backoff_max_ms_(0)
@@ -1946,6 +2198,8 @@ DownloadManager::DownloadManager(const unsigned max_pool_handles,
   curl_multi_ = curl_multi_init();
   assert(curl_multi_ != NULL);
   curl_multi_setopt(curl_multi_, CURLMOPT_SOCKETFUNCTION, CallbackCurlSocket);
+  curl_multi_setopt(curl_multi_, CURLMOPT_TIMERFUNCTION, CallbackCurlTimer);
+  curl_multi_setopt(curl_multi_, CURLMOPT_TIMERDATA, static_cast<void *>(this));
   curl_multi_setopt(curl_multi_, CURLMOPT_SOCKETDATA,
                     static_cast<void *>(this));
   curl_multi_setopt(curl_multi_, CURLMOPT_MAXCONNECTS, watch_fds_max_);
@@ -1991,6 +2245,168 @@ void DownloadManager::Spawn() {
 /**
  * Downloads data from an insecure outside channel (currently HTTP or file).
  */
+namespace {
+
+/** Minimum compressed object size for a parallel multi-range fetch */
+const int64_t kParallelFetchMinBytes = 2 * 1024 * 1024;
+/** Target size of each range of a parallel fetch */
+const int64_t kParallelFetchRangeBytes = 1024 * 1024;
+
+struct SubFetch {
+  DownloadManager *mgr;
+  JobInfo *job;
+  Failures result;
+};
+
+void *MainSubFetch(void *data) {
+  SubFetch *sub = static_cast<SubFetch *>(data);
+  sub->result = sub->mgr->Fetch(sub->job);
+  return NULL;
+}
+
+}  // anonymous namespace
+
+
+/**
+ * Downloads a large object as several concurrent range requests (one TCP
+ * flow each) and assembles, verifies and decompresses it on the caller
+ * thread.  On a link where a single flow is slow (latency, loss, per-flow
+ * caps) this multiplies the throughput of catalogs and other big single
+ * objects, which unlike chunked files cannot profit from read-ahead.
+ *
+ * Returns kFailUnsupportedProtocol if the object is not eligible (too small,
+ * no ranges supported, ...) so that the caller falls back to a plain fetch.
+ */
+Failures DownloadManager::FetchParallel(JobInfo *info) {
+  unsigned num_conns;
+  {
+    const MutexLockGuard m(lock_options_);
+    num_conns = opt_parallel_fetch_;
+  }
+  if ((num_conns < 2) || !info->parallel_ok()
+      || (atomic_xadd32(&multi_threaded_, 0) != 1)
+      || (info->expected_hash() == NULL) || (info->sink() == NULL)
+      || info->sink()->RequiresReserve() || info->head_request()
+      || (info->range_offset() != -1) || info->force_nocache()) {
+    return kFailUnsupportedProtocol;
+  }
+
+  // Size of the compressed object
+  JobInfo head(info->url(), info->probe_hosts());
+  *(head.GetPidPtr()) = info->pid();
+  *(head.GetUidPtr()) = info->uid();
+  *(head.GetGidPtr()) = info->gid();
+  if ((Fetch(&head) != kFailOk) || (head.content_length() < kParallelFetchMinBytes))
+    return kFailUnsupportedProtocol;
+  const int64_t total = head.content_length();
+  num_conns = std::min(static_cast<int64_t>(num_conns),
+                       (total + kParallelFetchRangeBytes - 1)
+                           / kParallelFetchRangeBytes);
+  const int64_t range = (total + num_conns - 1) / num_conns;
+  LogCvmfs(kLogDownload, kLogDebug,
+           "(manager '%s' - id %" PRId64 ") parallel fetch of %s: "
+           "%" PRId64 " bytes in %u ranges",
+           name_.c_str(), info->id(), info->url()->c_str(), total, num_conns);
+
+  // One raw (uncompressed, unhashed) range per connection
+  std::vector<cvmfs::MemSink *> sinks;
+  std::vector<JobInfo *> jobs;
+  std::vector<SubFetch> subs(num_conns);
+  std::vector<pthread_t> threads(num_conns);
+  for (unsigned i = 0; i < num_conns; ++i) {
+    const int64_t offset = static_cast<int64_t>(i) * range;
+    const int64_t size = std::min(range, total - offset);
+    cvmfs::MemSink *sink = new cvmfs::MemSink(static_cast<size_t>(size));
+    JobInfo *job = new JobInfo(info->url(), false /* compressed */,
+                               info->probe_hosts(), NULL /* hash */, sink);
+    job->SetRangeOffset(offset);
+    job->SetRangeSize(size);
+    *(job->GetPidPtr()) = info->pid();
+    *(job->GetUidPtr()) = info->uid();
+    *(job->GetGidPtr()) = info->gid();
+    sinks.push_back(sink);
+    jobs.push_back(job);
+    subs[i].mgr = this;
+    subs[i].job = job;
+    subs[i].result = kFailOther;
+    const int retval = pthread_create(&threads[i], NULL, MainSubFetch,
+                                      &subs[i]);
+    assert(retval == 0);
+  }
+  Failures result = kFailOk;
+  for (unsigned i = 0; i < num_conns; ++i) {
+    pthread_join(threads[i], NULL);
+    if (subs[i].result != kFailOk) {
+      // A range that did not make it (after its own retries and fail-over)
+      // is not fatal: the plain single-stream download resumes on its own
+      result = kFailUnsupportedProtocol;
+    } else if ((jobs[i]->http_code() != 206)
+               || (static_cast<int64_t>(sinks[i]->pos()) != jobs[i]->range_size())) {
+      // Range not honoured (200 with the full body) or short: not usable
+      result = kFailUnsupportedProtocol;
+    }
+  }
+
+  // Verify the content hash over the concatenated ranges
+  if (result == kFailOk) {
+    shash::ContextPtr ctx(info->expected_hash()->algorithm);
+    ctx.buffer = alloca(ctx.size);
+    shash::Init(ctx);
+    for (unsigned i = 0; i < num_conns; ++i)
+      shash::Update(sinks[i]->data(), sinks[i]->pos(), ctx);
+    shash::Any hash(info->expected_hash()->algorithm);
+    shash::Final(ctx, &hash);
+    if (hash != *(info->expected_hash())) {
+      LogCvmfs(kLogDownload, kLogDebug | kLogSyslogWarn,
+               "(manager '%s' - id %" PRId64 ") "
+               "parallel fetch of %s: hash mismatch, falling back",
+               name_.c_str(), info->id(), info->url()->c_str());
+      result = kFailUnsupportedProtocol;
+    }
+  }
+
+  // Decompress / copy into the caller's sink
+  if (result == kFailOk) {
+    if (info->compressed()) {
+      z_stream zstream;
+      zlib::DecompressInit(&zstream);
+      for (unsigned i = 0; (i < num_conns) && (result == kFailOk); ++i) {
+        const zlib::StreamStates retval = zlib::DecompressZStream2Sink(
+            sinks[i]->data(), static_cast<int64_t>(sinks[i]->pos()), &zstream,
+            info->sink());
+        if (retval == zlib::kStreamDataError)
+          result = kFailBadData;
+        else if (retval == zlib::kStreamIOError)
+          result = kFailLocalIO;
+      }
+      zlib::DecompressFini(&zstream);
+    } else {
+      for (unsigned i = 0; (i < num_conns) && (result == kFailOk); ++i) {
+        const int64_t written = info->sink()->Write(sinks[i]->data(),
+                                                    sinks[i]->pos());
+        if (written != static_cast<int64_t>(sinks[i]->pos()))
+          result = kFailLocalIO;
+      }
+    }
+    if ((result == kFailOk) && (info->sink()->Flush() != 0))
+      result = kFailLocalIO;
+    if (result != kFailOk)
+      info->sink()->Purge();
+  }
+
+  for (unsigned i = 0; i < num_conns; ++i) {
+    delete jobs[i];
+    delete sinks[i];
+  }
+  if (result == kFailUnsupportedProtocol) {
+    // Not usable as a parallel fetch; the caller restarts from scratch
+    info->sink()->Reset();
+  }
+  info->SetErrorCode(result);
+  return result;
+}
+
+
 Failures DownloadManager::Fetch(JobInfo *info) {
   assert(info != NULL);
   assert(info->url() != NULL);
@@ -1999,6 +2415,12 @@ Failures DownloadManager::Fetch(JobInfo *info) {
   result = PrepareDownloadDestination(info);
   if (result != kFailOk)
     return result;
+
+  if (opt_parallel_fetch_ > 1) {
+    result = FetchParallel(info);
+    if (result != kFailUnsupportedProtocol)
+      return result;
+  }
 
   if (info->expected_hash()) {
     const shash::Algorithms algorithm = info->expected_hash()->algorithm;
@@ -2263,6 +2685,16 @@ void DownloadManager::SetTimeout(const unsigned seconds_proxy,
 void DownloadManager::SetLowSpeedLimit(const unsigned low_speed_limit) {
   const MutexLockGuard m(lock_options_);
   opt_low_speed_limit_ = low_speed_limit;
+}
+
+void DownloadManager::SetTcpKeepalive(const unsigned idle_seconds) {
+  const MutexLockGuard m(lock_options_);
+  opt_tcp_keepalive_ = idle_seconds;
+}
+
+void DownloadManager::SetParallelFetch(const unsigned num_connections) {
+  const MutexLockGuard m(lock_options_);
+  opt_parallel_fetch_ = num_connections;
 }
 
 
@@ -3302,6 +3734,8 @@ DownloadManager *DownloadManager::Clone(
   clone->opt_timeout_proxy_ = opt_timeout_proxy_;
   clone->opt_timeout_direct_ = opt_timeout_direct_;
   clone->opt_low_speed_limit_ = opt_low_speed_limit_;
+  clone->opt_tcp_keepalive_ = opt_tcp_keepalive_;
+  clone->opt_parallel_fetch_ = opt_parallel_fetch_;
   clone->opt_max_retries_ = opt_max_retries_;
   clone->opt_backoff_init_ms_ = opt_backoff_init_ms_;
   clone->opt_backoff_max_ms_ = opt_backoff_max_ms_;

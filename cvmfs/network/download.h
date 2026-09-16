@@ -183,6 +183,7 @@ class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
   DownloadManager *Clone(const perf::StatisticsTemplate &statistics,
                          const std::string &cloned_name);
   Failures Fetch(JobInfo *info);
+  Failures FetchParallel(JobInfo *info);
 
   void SetCredentialsAttachment(CredentialsAttachment *ca);
   std::string GetDnsServer() const;
@@ -193,6 +194,8 @@ class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
   void SetTimeout(const unsigned seconds_proxy, const unsigned seconds_direct);
   void GetTimeout(unsigned *seconds_proxy, unsigned *seconds_direct);
   void SetLowSpeedLimit(const unsigned low_speed_limit);
+  void SetTcpKeepalive(const unsigned idle_seconds);
+  void SetParallelFetch(const unsigned num_connections);
   void SetMetalinkChain(const std::string &metalink_list);
   void SetMetalinkChain(const std::vector<std::string> &metalink_list);
   void GetMetalinkInfo(std::vector<std::string> *metalink_chain,
@@ -260,6 +263,7 @@ class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
   dns::IpPreference opt_ip_preference() const { return opt_ip_preference_; }
 
  private:
+  static int CallbackCurlTimer(CURLM *multi, long timeout_ms, void *userp);
   static int CallbackCurlSocket(CURL *easy, curl_socket_t s, int action,
                                 void *userp, void *socketp);
   static void *MainDownload(void *data);
@@ -319,6 +323,8 @@ class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
   uint32_t watch_fds_size_;
   uint32_t watch_fds_inuse_;
   uint32_t watch_fds_max_;
+  /** Next timeout requested by libcurl (CURLMOPT_TIMERFUNCTION), -1: none */
+  long curl_timeout_ms_;  // NOLINT
 
   pthread_mutex_t *lock_options_;
   pthread_mutex_t *lock_synchronous_mode_;
@@ -327,6 +333,17 @@ class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
   unsigned opt_timeout_proxy_;
   unsigned opt_timeout_direct_;
   unsigned opt_low_speed_limit_;
+  /** TCP keep-alive probe interval in seconds, 0 disables keep-alive */
+  unsigned opt_tcp_keepalive_;
+  /** Split large objects into this many concurrent range requests, 0: off */
+  unsigned opt_parallel_fetch_;
+  /**
+   * Until this time, new requests bypass libcurl's connection pool.  Set after
+   * a transfer timeout: the other pooled connections were idle for as long as
+   * the one that just stalled and were most likely killed by the same
+   * middlebox.
+   */
+  time_t opt_fresh_connect_until_;
   unsigned opt_max_retries_;
   unsigned opt_backoff_init_ms_;
   unsigned opt_backoff_max_ms_;
