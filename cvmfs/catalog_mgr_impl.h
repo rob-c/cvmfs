@@ -1001,6 +1001,13 @@ CatalogT *AbstractCatalogManager<CatalogT>::LoadFreeCatalog(
 
   CatalogT *catalog = CatalogT::AttachFreely(
       mountpoint.ToString(), ctlg_context.sqlite_path(), ctlg_context.hash());
+  // AttachFreely() returns NULL when the catalog database cannot be opened,
+  // for instance because the downloaded file is truncated or corrupt.  The
+  // callers of LoadFreeCatalog() already test the result for NULL, but the
+  // dereference below would crash before they get the chance.
+  if (catalog == NULL) {
+    return NULL;
+  }
   catalog->TakeDatabaseFileOwnership();
   return catalog;
 }
