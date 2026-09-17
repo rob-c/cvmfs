@@ -8,6 +8,9 @@
 
 #include "swissknife_list_reflog.h"
 
+#include <errno.h>
+#include <unistd.h>
+
 #include "manifest.h"
 #include "object_fetcher.h"
 #include "reflog.h"
@@ -155,8 +158,22 @@ bool CommandListReflog::Run(ObjectFetcherT *object_fetcher, string repo_name,
     DumpObjects(stdout);
   } else {
     const int fd = open(output_path.c_str(), O_WRONLY | O_CREAT, 0644);
-    assert(fd);
+    // open() reports failure as -1, which is non-zero: the previous
+    // assert(fd) could never fire.  fdopen(-1) then returns NULL and
+    // DumpObjects()/fclose() dereference it.
+    if (fd < 0) {
+      LogCvmfs(kLogCvmfs, kLogStderr, "Failed to open %s (errno: %d)",
+               output_path.c_str(), errno);
+      return false;
+    }
     FILE *stream = fdopen(fd, "w");
+    if (stream == NULL) {
+      LogCvmfs(kLogCvmfs, kLogStderr,
+               "Failed to open stream for %s (errno: %d)", output_path.c_str(),
+               errno);
+      close(fd);
+      return false;
+    }
     DumpObjects(stream);
     fclose(stream);  // no need to call close after fclose
   }
