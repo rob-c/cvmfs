@@ -101,6 +101,10 @@ bool MakeAcquireRequest(const std::string &key_id, const std::string &secret,
 
   curl_easy_cleanup(h_curl);
   h_curl = NULL;
+  // curl_easy_cleanup() does not release the header list; it has to be freed
+  // separately once the transfer is done (see curl_slist_free_all(3)).
+  curl_slist_free_all(auth_header);
+  auth_header = NULL;
 
   return !ret;
 }
@@ -178,6 +182,10 @@ bool MakeEndRequest(const std::string &method, const std::string &key_id,
 
   curl_easy_cleanup(h_curl);
   h_curl = NULL;
+  // curl_easy_cleanup() does not release the header list; it has to be freed
+  // separately once the transfer is done (see curl_slist_free_all(3)).
+  curl_slist_free_all(auth_header);
+  auth_header = NULL;
 
   return ok && !ret;
 }
