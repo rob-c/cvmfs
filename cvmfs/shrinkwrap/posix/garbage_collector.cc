@@ -65,6 +65,15 @@ void FinalizeGarbageCollection(struct fs_traversal_context *ctx) {
   std::string gc_path = std::string(ctx->data) + POSIX_GARBAGE_DIR
                         + POSIX_GARBAGE_FLAGGED_FILE;
   FILE *gc_flagged_file = fopen(gc_path.c_str(), "w");
+  // fopen() fails e.g. if the garbage directory was removed underneath us or
+  // the file system is full or read-only.  Passing the resulting NULL to
+  // fwrite()/fclose() below crashes instead of reporting the problem.
+  if (gc_flagged_file == NULL) {
+    LogCvmfs(kLogCvmfs, kLogStderr,
+             "Failed to open garbage collection file %s (errno: %d)",
+             gc_path.c_str(), errno);
+    return;
+  }
   for (std::map<ino_t, bool>::const_iterator it = posix_ctx->gc_flagged.begin();
        it != posix_ctx->gc_flagged.end();
        it++) {
