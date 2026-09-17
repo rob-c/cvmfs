@@ -419,6 +419,11 @@ bool SessionContext::DoUpload(const SessionContext::UploadJob *job) {
 
   curl_easy_cleanup(h_curl);
   h_curl = NULL;
+  // curl_easy_cleanup() does not release the header list; it has to be freed
+  // separately once the transfer is done.  Without this every uploaded payload
+  // leaks its two header entries.
+  curl_slist_free_all(auth_header);
+  auth_header = NULL;
 
   return ok && !ret;
 }
