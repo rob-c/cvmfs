@@ -147,8 +147,16 @@ bool SessionContextBase::Finalize(bool commit, const std::string &old_root_hash,
   {
     const MutexLockGuard lock(current_pack_mtx_);
 
-    if (current_pack_ && current_pack_->GetNoObjects() > 0) {
-      Dispatch();
+    if (current_pack_) {
+      if (current_pack_->GetNoObjects() > 0) {
+        // Dispatch() hands ownership of the pack to the upload queue
+        Dispatch();
+      } else {
+        // An open but empty pack is not dispatched, so nothing else will ever
+        // free it.  Releasing it here avoids leaking the pack (and the buckets
+        // it owns) for every session that ends with an empty pack.
+        delete current_pack_;
+      }
       current_pack_ = NULL;
     }
   }
@@ -234,7 +242,15 @@ bool SessionContextBase::CommitBucket(const ObjectPack::BucketContentType type,
     }
 
     if (current_pack_->GetNoObjects() > 0) {
+      // Dispatch() hands ownership of the pack to the upload queue
       Dispatch();
+    } else {
+      // The object did not fit and every open bucket has been transferred to
+      // new_pack, so the old pack holds nothing worth dispatching.  It is
+      // still owned here, and the assignment below would drop the last
+      // reference to it: free it explicitly.  This is the common case when a
+      // single object is larger than max_pack_size_.
+      delete current_pack_;
     }
     current_pack_ = new_pack;
 
