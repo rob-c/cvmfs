@@ -1095,6 +1095,124 @@ TEST_F(T_Download, NoProxyChainIsNotSelectable) {
 }
 
 
+namespace {
+// Stands in for a saturated proxy: it answers, so it is plainly reachable,
+// but the body is cut short.  That is a throughput symptom, reported as
+// kFailProxyShortTransfer, not evidence of a dead peer.  Fewer than
+// kMinResumeProgress bytes are delivered so no attempt counts as progress.
+HTTPResponse TruncatingProxyHandler(const HTTPRequest & /* req */, void *data) {
+  int *hits = static_cast<int *>(data);
+  if (hits)
+    (*hits)++;
+  HTTPResponse response;
+  response.raw = true;
+  response.body = "HTTP/1.1 200 OK\r\nContent-Length: 65536\r\n\r\nshort";
+  return response;
+}
+
+HTTPResponse CountingProxyHandler(const HTTPRequest & /* req */, void *data) {
+  int *hits = static_cast<int *>(data);
+  if (hits)
+    (*hits)++;
+  HTTPResponse response;
+  response.code = 200;
+  response.body = "served by the fallback proxy";
+  return response;
+}
+}  // namespace
+
+
+TEST_F(T_Download, EscalatedProxyGroupClassification) {
+  vector<vector<DownloadManager::ProxyInfo> > chain;
+  unsigned current_group = 0;
+  unsigned fallback_group = 0;
+
+  // "proxy;DIRECT" plus a fallback: group 0 is local, group 1 is the DIRECT
+  // tier, group 2 is off-site.  Only the first is not an escalation.
+  download_mgr.SetProxyChain("http://127.0.0.1:3128;DIRECT",
+                             "http://127.0.0.2:3128",
+                             DownloadManager::kSetProxyBoth);
+  download_mgr.GetProxyInfo(&chain, &current_group, &fallback_group);
+  ASSERT_EQ(3U, chain.size());
+  EXPECT_FALSE(download_mgr.IsEscalatedProxyGroup(0));
+  EXPECT_TRUE(download_mgr.IsEscalatedProxyGroup(1));   // DIRECT tier
+  EXPECT_TRUE(download_mgr.IsEscalatedProxyGroup(2));   // fallback proxy
+  EXPECT_FALSE(download_mgr.IsEscalatedProxyGroup(99));  // out of range
+
+  // Two local groups and no DIRECT: moving between them is plain failover.
+  download_mgr.SetProxyChain("http://127.0.0.1:3128;http://127.0.0.3:3128", "",
+                             DownloadManager::kSetProxyBoth);
+  EXPECT_FALSE(download_mgr.IsEscalatedProxyGroup(0));
+  EXPECT_FALSE(download_mgr.IsEscalatedProxyGroup(1));
+}
+
+
+TEST_F(T_Download, SlowProxyDoesNotEscalateToDirect) {
+  // The regression for the leak measured under load: a proxy that is merely
+  // saturated must not promote the DIRECT tier, because that puts unproxied
+  // traffic on the wire and then lets host failover roam the server list.
+  string src_path = GetSmallFile();
+  MockFileServer origin(8110, sandbox_path_);
+  int proxy_hits = 0;
+  MockHTTPServer slow_proxy(8111);
+  ASSERT_TRUE(slow_proxy.SetResponseCallback(TruncatingProxyHandler,
+                                             &proxy_hits));
+  ASSERT_TRUE(slow_proxy.Start());
+
+  download_mgr.SetProxyChain("http://127.0.0.1:8111;DIRECT", "",
+                             DownloadManager::kSetProxyBoth);
+  download_mgr.SetRetryParameters(2, 0, 0);
+
+  const string url = "http://127.0.0.1:8110/" + GetFileName(src_path);
+  cvmfs::MemSink sink;
+  JobInfo info(&url, false /* compressed */, false /* probe hosts */, NULL,
+               &sink);
+  download_mgr.Fetch(&info);
+
+  EXPECT_NE(kFailOk, info.error_code());
+  EXPECT_GT(proxy_hits, 0) << "the proxy was never even tried";
+  // The decisive assertion: the origin was never contacted directly.
+  EXPECT_EQ(0, origin.num_processed_requests());
+  EXPECT_NE("DIRECT", info.proxy());
+  slow_proxy.Stop();
+}
+
+
+TEST_F(T_Download, SlowProxyDoesNotEscalateToFallback) {
+  // Same rule for the off-site fallback proxies: saturation at the local
+  // proxy is not a reason to ship the request to another site.
+  string src_path = GetSmallFile();
+  MockFileServer origin(8112, sandbox_path_);
+  int slow_hits = 0;
+  int fallback_hits = 0;
+  MockHTTPServer slow_proxy(8113);
+  ASSERT_TRUE(slow_proxy.SetResponseCallback(TruncatingProxyHandler,
+                                             &slow_hits));
+  ASSERT_TRUE(slow_proxy.Start());
+  MockHTTPServer fallback_proxy(8114);
+  ASSERT_TRUE(fallback_proxy.SetResponseCallback(CountingProxyHandler,
+                                                 &fallback_hits));
+  ASSERT_TRUE(fallback_proxy.Start());
+
+  download_mgr.SetProxyChain("http://127.0.0.1:8113",
+                             "http://127.0.0.1:8114",
+                             DownloadManager::kSetProxyBoth);
+  download_mgr.SetRetryParameters(2, 0, 0);
+
+  const string url = "http://127.0.0.1:8112/" + GetFileName(src_path);
+  cvmfs::MemSink sink;
+  JobInfo info(&url, false, false, NULL, &sink);
+  download_mgr.Fetch(&info);
+
+  EXPECT_NE(kFailOk, info.error_code());
+  EXPECT_GT(slow_hits, 0);
+  EXPECT_EQ(0, fallback_hits) << "a saturated local proxy escalated off-site";
+  EXPECT_EQ(0, origin.num_processed_requests());
+  slow_proxy.Stop();
+  fallback_proxy.Stop();
+}
+
+
 TEST_F(T_Download, ValidateGeoReply) {
   vector<uint64_t> geo_order;
   EXPECT_FALSE(download_mgr.ValidateGeoReply("", geo_order.size(), &geo_order));

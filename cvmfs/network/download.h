@@ -138,6 +138,7 @@ class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
   FRIEND_TEST(T_Download, SocketTeardownIsBounded);
   FRIEND_TEST(T_Download, ParallelFetchAndProxyMandatorySurviveClone);
   FRIEND_TEST(T_Download, NoProxyChainIsNotSelectable);
+  FRIEND_TEST(T_Download, EscalatedProxyGroupClassification);
 
  public:
   // HostInfo is used for both metalink and host
@@ -290,6 +291,7 @@ class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
   bool StripDirect(const std::string &proxy_list, std::string *cleaned_list);
   std::string DemoteDirect(const std::string &proxy_list,
                            bool *has_direct_group);
+  bool IsEscalatedProxyGroup(unsigned group_idx) const;
   bool ValidateGeoReply(const std::string &reply_order,
                         const unsigned expected_size,
                         std::vector<uint64_t> *reply_vals);
