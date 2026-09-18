@@ -60,6 +60,13 @@ Both use a **private** mount (`CVMFS_CACHE_BASE` under `$LAB`, default
 `/var/tmp/cvmfs-losslab`) pointed at the relay, so the host's production mounts
 keep talking to the proxy directly and are unaffected.
 
+## Comparing against stock
+
+`bench-ab.sh` runs one arm of a stock-vs-branch comparison and `analyse-ab.py`
+tabulates the results; see BENCHMARK.md for what was measured and, importantly,
+for the `CVMFS_LIBRARY_PATH` trap -- `cvmfs2` is only a loader, so running a
+stock `cvmfs2` without it silently exercises the installed library instead.
+
 ## What to look for
 
 The pass conditions are not "it was fast".  They are:

@@ -18,7 +18,7 @@ presents to the application above TCP:
 It does NOT emulate reordering or duplication, and it cannot corrupt the byte
 stream, because TCP would have repaired that below us anyway.
 """
-import argparse, random, socket, sys, threading, time
+import argparse, random, signal, socket, sys, threading, time
 
 MSS = 1460
 
@@ -134,6 +134,16 @@ def main():
                              f" stalls={stats.stalls} resets={stats.resets}\n")
             sys.stderr.flush()
     threading.Thread(target=reporter, daemon=True).start()
+
+    def final(_sig=None, _frm=None):
+        # Short runs can end before the first periodic report, so always emit
+        # the totals on the way out.
+        sys.stderr.write(f"  [relay] FINAL conns={stats.conns} bytes={stats.bytes}"
+                         f" stalls={stats.stalls} resets={stats.resets}\n")
+        sys.stderr.flush()
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, final)
+    signal.signal(signal.SIGINT, final)
 
     while True:
         try:
