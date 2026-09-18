@@ -205,6 +205,14 @@ class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
   DownloadManager *Clone(const perf::StatisticsTemplate &statistics,
                          const std::string &cloned_name);
   Failures Fetch(JobInfo *info);
+  /**
+   * Splits one large object into several concurrent range requests, which on a
+   * high-latency link recovers the throughput a single TCP stream cannot.
+   * Returns kFailUnsupportedProtocol when the job is not a candidate -- too
+   * small, no expected hash, a sink that pre-reserves, already a range request,
+   * single-threaded manager -- which the caller treats as "not applicable" and
+   * falls back to an ordinary fetch rather than as an error.
+   */
   Failures FetchParallel(JobInfo *info);
 
   void SetCredentialsAttachment(CredentialsAttachment *ca);

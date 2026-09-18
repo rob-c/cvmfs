@@ -625,6 +625,11 @@ void *DownloadManager::MainDownload(void *data) {
           1000 * DiffTimeSeconds(timeval_start, timeval_stop));
       perf::Xadd(download_mgr->counters_->sz_transfer_time, delta);
     }
+    // Retries waiting out their backoff must not be slept through here: this
+    // is the single I/O thread for every transfer of this manager.  Instead
+    // the poll() below is shortened to the earliest moment at which one of
+    // them becomes due, so the thread keeps serving other transfers and wakes
+    // exactly when there is something to re-issue.
     if (!deferred.empty()) {
       const uint64_t now_ms = platform_monotonic_time_ns() / 1000000;
       uint64_t next_ms = deferred[0]->retry_not_before_ms();
@@ -735,6 +740,9 @@ void *DownloadManager::MainDownload(void *data) {
 
         curl_multi_remove_handle(download_mgr->curl_multi_, easy_handle);
         if (download_mgr->VerifyAndFinalize(curl_error, info)) {
+          // Backoff() marked this retry as not-before a given time rather
+          // than sleeping.  Park it until then; its easy handle stays out of
+          // the multi stack meanwhile and is re-added above when due.
           if (info->retry_not_before_ms() > 0) {
             deferred.push_back(info);
           } else {
@@ -757,6 +765,9 @@ void *DownloadManager::MainDownload(void *data) {
     }
   }
 
+  // The thread is terminating, so retries still waiting out their backoff will
+  // never be re-issued.  Fail them explicitly rather than leaving their callers
+  // blocked forever on a result that is no longer coming.
   for (unsigned i = 0; i < deferred.size(); ++i) {
     JobInfo *info = deferred[i];
     info->SetErrorCode(kFailOther);
@@ -1376,6 +1387,13 @@ void DownloadManager::SetUrlOptions(JobInfo *info) {
       if (opt_proxy_groups_current_ >= opt_proxy_groups_fallback_) {
         // It doesn't make sense to use the fallback proxies in Geo-API requests
         // since the fallback proxies are supposed to get sorted, too.
+        // Dropping to an unproxied request to achieve that is only acceptable
+        // where direct connections are acceptable at all.  This branch is
+        // reached exactly while the local proxy is being failed over, so an
+        // unconditional switch here put the Geo-API query on the wire
+        // unproxied at the one moment a mandatory-proxy site can least afford
+        // it.  The query still goes out, through whichever proxy is current;
+        // only the cache-key template falls back to the direct form.
         if (!opt_proxy_mandatory_) {
           info->SetProxy("DIRECT");
           curl_easy_setopt(info->curl_handle(), CURLOPT_PROXY, "");
@@ -2547,6 +2565,10 @@ Failures DownloadManager::Fetch(JobInfo *info) {
   if (result != kFailOk)
     return result;
 
+  // Try the ranged, multi-connection path first.  kFailUnsupportedProtocol is
+  // its way of saying "this job is not a candidate", not a real failure, so
+  // anything else -- success or a genuine error -- is the final answer and
+  // only that sentinel falls through to the ordinary single-stream fetch.
   if (opt_parallel_fetch_ > 1) {
     result = FetchParallel(info);
     if (result != kFailUnsupportedProtocol)
@@ -3769,6 +3791,10 @@ void DownloadManager::UpdateProxiesUnlocked(const string &reason) {
 
   // Identify number of non-burned proxies within the current group
   vector<ProxyInfo> *group = current_proxy_group();
+  // Nothing selectable: either no chain is installed or every proxy in the
+  // current group is burned.  Both would otherwise reach prng_.Next(0) and
+  // index an empty vector below, which is undefined behaviour rather than a
+  // clean "no proxy available".
   if ((group == NULL) || group->empty()
       || (opt_proxy_groups_current_burned_ >= group->size())) {
     return;

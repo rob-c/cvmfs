@@ -117,6 +117,7 @@ class JobInfo {
   uint64_t no_progress_since_ms_;
   /** Large single objects may be fetched as parallel ranges (catalogs) */
   bool parallel_ok_;
+  /** Failure meant the peer never answered; see peer_unresponsive() */
   bool peer_unresponsive_;
   int current_metalink_chain_index_;
   int current_host_chain_index_;

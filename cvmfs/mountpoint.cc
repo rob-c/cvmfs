@@ -2340,6 +2340,9 @@ bool MountPoint::SetupExternalDownloadMgr(bool dogeosort) {
       boot_status_ = loader::kFailWpad;
       return false;
     }
+    // An explicit external proxy replaces the inherited configuration whole:
+    // keeping the regular chain's fallbacks behind a different primary would
+    // send external data somewhere the administrator never named for it.
     fallback_proxies = "";
   }
   if (options_mgr_->GetValue("CVMFS_EXTERNAL_FALLBACK_PROXY", &optarg))
@@ -2377,8 +2380,12 @@ void MountPoint::SetupHttpTuning() {
 
   if (options_mgr_->GetValue("CVMFS_LOW_SPEED_LIMIT", &optarg))
     download_mgr_->SetLowSpeedLimit(String2Uint64(optarg));
+  // Idle-connection probe interval; see opt_tcp_keepalive_ for why the client
+  // probes at all.  An explicit 0 disables it, overriding the default.
   if (options_mgr_->GetValue("CVMFS_TCP_KEEPALIVE", &optarg))
     download_mgr_->SetTcpKeepalive(String2Uint64(optarg));
+  // Number of concurrent range requests for one large object; see
+  // FetchParallel() for which objects qualify.
   if (options_mgr_->GetValue("CVMFS_PARALLEL_FETCH", &optarg))
     download_mgr_->SetParallelFetch(String2Uint64(optarg));
   if (options_mgr_->GetValue("CVMFS_PROXY_RESET_AFTER", &optarg)) {

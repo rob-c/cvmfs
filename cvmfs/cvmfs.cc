@@ -1365,6 +1365,9 @@ static void cvmfs_open(fuse_req_t req, fuse_ino_t ino,
       fi->fh = fd;
       FillOpenFlags(open_directives, fi);
 #ifdef FUSE_CAP_PASSTHROUGH
+      // loader_exports_ is only populated by Init(); the fuse callbacks are
+      // also driven directly by the mock-fuse unit tests, which never call it,
+      // so the pointer has to be checked rather than assumed.
       if (loader_exports_ && loader_exports_->fuse_passthrough) {
         if (!dirent.IsChunkedFile()) {
           /* "Currently there should be only one backing id per node / backing
@@ -1535,6 +1538,10 @@ static void cvmfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
           label.flags |= CacheManager::kLabelExternal;
           label.range_offset = chunks.list->AtPtr(chunk_idx)->offset();
         } else if (chunk_readahead_ != NULL) {
+          // Only for cached chunks: external data is ranged out of a remote
+          // file and has no separate objects to prefetch.  Start at the chunk
+          // after the one about to be fetched, so the read-ahead runs ahead of
+          // the reader rather than duplicating its work.
           chunk_readahead_->Schedule(
               chunks, chunk_idx + 1, this_fetcher,
               mount_point_->catalog_mgr()->volatile_flag());
@@ -2553,6 +2560,11 @@ static int Init(const loader::LoaderExports *loader_exports) {
       cvmfs::mount_point_, &cvmfs::inode_generation_info_, fuse_session,
       fuse_notify_invalidation);
 
+  // CVMFS_CHUNK_READAHEAD is how many chunks ahead of the reader to prefetch;
+  // zero, the default, leaves the pointer NULL and the feature off.  The
+  // worker count is capped at eight because the point is to fill the link with
+  // a handful of parallel streams, and beyond that the threads compete for the
+  // same proxy and cache without adding throughput.
   unsigned chunk_readahead = 0;
   if (cvmfs::options_mgr_->GetValue("CVMFS_CHUNK_READAHEAD", &buf))
     chunk_readahead = String2Uint64(buf);
@@ -2720,6 +2732,9 @@ static void ShutdownMountpoint() {
   // The remounter has a reference to the mount point and the inode generation
   delete cvmfs::fuse_remounter_;
   cvmfs::fuse_remounter_ = NULL;
+  // Before mount_point_ and file_system_ below: the destructor joins the
+  // read-ahead workers, and until they have stopped they may still be inside
+  // a fetch that uses both.
   delete cvmfs::chunk_readahead_;
   cvmfs::chunk_readahead_ = NULL;
 
