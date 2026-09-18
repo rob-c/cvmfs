@@ -90,6 +90,25 @@ Watchdog *watchdog_ = NULL;
 FuseRemounter *fuse_remounter_ = NULL;
 InodeGenerationInfo inode_generation_info_;
 
+/**
+ * Mirrors the production read-ahead helper, which lives inside the
+ * __TEST_CVMFS_MOCKFUSE guard in cvmfs.cc together with the globals above.
+ * Its uses in the read path and in Spawn()/ShutdownMountpoint() are not
+ * guarded, so the mock build needs the type and the pointer to exist.  Every
+ * one of those uses is conditional on the pointer being non-NULL, and it stays
+ * NULL here, so the members are never actually entered; Schedule() is a
+ * template purely so the mock does not have to name the production argument
+ * types.
+ */
+class ChunkReadahead {
+ public:
+  void Spawn() { }
+  void Stop() { }
+  template <typename ChunksT, typename FetcherT>
+  void Schedule(const ChunksT &, unsigned, FetcherT *, bool) { }
+};
+ChunkReadahead *chunk_readahead_ = NULL;
+
 
 /**
  * Replaces the production helper.  Same signature and same meaning of the

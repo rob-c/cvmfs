@@ -115,10 +115,29 @@ class CredentialsAttachment {
  * Note when adding new fields: Clone() probably needs to be adjusted, too.
  * TODO(jblomer): improve ordering of members
  */
+/**
+ * Exposed for unit tests: applies the socket options libcurl would set from
+ * inside a live connection attempt.
+ */
+int CallbackCurlSockoptForTest(void *clientp, curl_socket_t curlfd,
+                               curlsocktype purpose);
+
+
 class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
   FRIEND_TEST(T_Download, ValidateGeoReply);
   FRIEND_TEST(T_Download, StripDirect);
   FRIEND_TEST(T_Download, EscapeUrl);
+  FRIEND_TEST(T_Download, ProxyDemoteDirect);
+  FRIEND_TEST(T_Download, ProxyDirectKeptAsLastResortTier);
+  FRIEND_TEST(T_Download, ProxyDirectNotPeerOfLiveProxy);
+  FRIEND_TEST(T_Download, ProxyDirectOnlyPreserved);
+  FRIEND_TEST(T_Download, HttpStatusLineAnyVersion);
+  FRIEND_TEST(T_Download, CurlHandlePoolRespectsMaximum);
+  FRIEND_TEST(T_Download, WatchFdsShrinkBackToFloor);
+  FRIEND_TEST(T_Download, TcpKeepaliveOnByDefault);
+  FRIEND_TEST(T_Download, SocketTeardownIsBounded);
+  FRIEND_TEST(T_Download, ParallelFetchAndProxyMandatorySurviveClone);
+  FRIEND_TEST(T_Download, NoProxyChainIsNotSelectable);
 
  public:
   // HostInfo is used for both metalink and host
@@ -269,6 +288,8 @@ class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
   static void *MainDownload(void *data);
 
   bool StripDirect(const std::string &proxy_list, std::string *cleaned_list);
+  std::string DemoteDirect(const std::string &proxy_list,
+                           bool *has_direct_group);
   bool ValidateGeoReply(const std::string &reply_order,
                         const unsigned expected_size,
                         std::vector<uint64_t> *reply_vals);
@@ -392,6 +413,16 @@ class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
    * Overall number of proxies summed over all the groups.
    */
   unsigned opt_num_proxies_;
+  /**
+   * True when a real (non-DIRECT) proxy is configured and the configuration
+   * offers no DIRECT tier to fall back on.  While this holds, a direct
+   * connection is never an acceptable substitute for the proxy and requests
+   * are failed instead of silently bypassing it.  Writing DIRECT into the
+   * chain, as in "proxy;DIRECT", clears the flag and re-enables an unproxied
+   * last resort -- reached only once the proxy has actually failed, see
+   * DemoteDirect().  Configurations with no proxy at all also leave it false.
+   */
+  bool opt_proxy_mandatory_;
   /**
    * The original proxy list provided to SetProxyChain.
    */

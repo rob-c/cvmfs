@@ -496,7 +496,16 @@ FileSystem::~FileSystem() {
   SetLogSyslogPrefix("");
   SetLogMicroSyslog("");
   SetLogDebugFile("");
-  google::protobuf::ShutdownProtobufLibrary();
+  // Deliberately no google::protobuf::ShutdownProtobufLibrary() here.  That
+  // call is process-global and irreversible: once it has run, constructing any
+  // protobuf message again throws std::system_error.  A FileSystem is not
+  // tied to the lifetime of the process -- only one may exist at a time, but
+  // several are created in sequence: InitSystemFs() destroys one and creates
+  // another when it has to wait for the workspace lock, libcvmfs attaches and
+  // detaches repeatedly, and the unit tests build one per test case.  Tearing
+  // protobuf down here left every later external cache manager, which speaks
+  // protobuf over its socket, unable to construct a single message.  Protobuf
+  // releases its static memory through its own exit handlers anyway.
   g_alive = false;
 }
 
@@ -2312,7 +2321,15 @@ bool MountPoint::SetupExternalDownloadMgr(bool dogeosort) {
     }
   }
 
-  string proxies = "DIRECT";
+  // Without an explicit setting, inherit the regular download manager's proxy
+  // configuration rather than defaulting to DIRECT.  Defaulting to DIRECT made
+  // external data bypass a proxy that the administrator had configured for
+  // everything else, which is both surprising and, where only proxied traffic
+  // is permitted to leave the host, a silent leak.
+  string proxies = download_mgr_->GetProxyList();
+  string fallback_proxies = download_mgr_->GetFallbackProxyList();
+  if (proxies == "")
+    proxies = "DIRECT";
   if (options_mgr_->GetValue("CVMFS_EXTERNAL_HTTP_PROXY", &optarg)) {
     proxies = download::ResolveProxyDescription(
         optarg,
@@ -2323,8 +2340,8 @@ bool MountPoint::SetupExternalDownloadMgr(bool dogeosort) {
       boot_status_ = loader::kFailWpad;
       return false;
     }
+    fallback_proxies = "";
   }
-  string fallback_proxies;
   if (options_mgr_->GetValue("CVMFS_EXTERNAL_FALLBACK_PROXY", &optarg))
     fallback_proxies = optarg;
   external_download_mgr_->SetProxyChain(

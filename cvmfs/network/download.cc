@@ -31,10 +31,13 @@
 #include <alloca.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
+#include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -145,13 +148,20 @@ static size_t CallbackCurlHeader(void *ptr, size_t size, size_t nmemb,
   //          header_line.c_str());
 
   // Check http status codes
-  if (HasPrefix(header_line, "HTTP/1.", false)) {
-    if (header_line.length() < 10) {
+  if (HasPrefix(header_line, "HTTP/", false)) {
+    // The status code follows the version token.  That token is "1.1" or
+    // "1.0", but also a bare "2" or "3", so it has no fixed width: locate the
+    // code after the first space rather than at a hard-coded offset.  Assuming
+    // "HTTP/1." left http_code at -1 for every HTTP/2 reply, which suppresses
+    // the error handling below and the 2xx check that gates resuming.
+    const size_t pos_code = header_line.find(' ');
+    if (pos_code == string::npos) {
       return 0;
     }
 
     unsigned i;
-    for (i = 8; (i < header_line.length()) && (header_line[i] == ' '); ++i) {
+    for (i = pos_code; (i < header_line.length()) && (header_line[i] == ' ');
+         ++i) {
     }
 
     // Code is initialized to -1
@@ -534,7 +544,11 @@ int DownloadManager::CallbackCurlSocket(CURL * /* easy */,
       }
       download_mgr->watch_fds_inuse_--;
       // Shrink array if necessary
-      if ((download_mgr->watch_fds_inuse_ > download_mgr->watch_fds_max_)
+      // watch_fds_max_ is the floor for the allocation; the test has to be
+      // on the array size, not on how much of it is in use.  Comparing
+      // watch_fds_inuse_ meant the array only ever shrank while it was still
+      // heavily used, so after a burst it stayed at its peak size for good.
+      if ((download_mgr->watch_fds_size_ > download_mgr->watch_fds_max_)
           && (download_mgr->watch_fds_inuse_
               < download_mgr->watch_fds_size_ / 2)) {
         download_mgr->watch_fds_size_ /= 2;
@@ -916,6 +930,61 @@ string DownloadManager::ProxyInfo::Print() {
  * Gets an idle CURL handle from the pool. Creates a new one and adds it to
  * the pool if necessary.
  */
+/**
+ * Upper bound on how long data may stay unacknowledged before the kernel gives
+ * up on a connection, and how many keep-alive probes may go unanswered.
+ *
+ * Keep-alive only governs a connection that is *idle*.  As soon as anything is
+ * in flight -- a request, or the FIN that closes the connection -- the
+ * retransmit timer takes over, and that is bounded by net.ipv4.tcp_retries2,
+ * whose default of 15 works out at roughly a quarter of an hour.  So when a
+ * firewall swallows the peer's ACK or RST, the socket does not fail: it sits
+ * there retransmitting into the filtered path, stuck in LAST-ACK or holding a
+ * request that will never be answered, long after the peer has forgotten it.
+ *
+ * TCP_USER_TIMEOUT overrides tcp_retries2 for this socket, so an unacknowledged
+ * teardown, or an unanswered request, is abandoned in seconds rather than
+ * minutes.  It costs nothing on a healthy connection: while the peer keeps
+ * acknowledging, the timer never fires, so slow-but-alive transfers are not
+ * affected.  TCP_KEEPCNT bounds dead-peer detection in the same spirit;
+ * libcurl only gained an option for it in 8.9, so it is set directly here.
+ */
+static const unsigned kTcpUserTimeoutMs = 60000;
+static const int kTcpKeepaliveProbes = 3;
+
+
+/**
+ * Applied by libcurl to every socket it opens for a connection.
+ */
+static int CallbackCurlSockopt(void * /* clientp */,
+                               curl_socket_t curlfd,
+                               curlsocktype purpose) {
+  if (purpose != CURLSOCKTYPE_IPCXN)
+    return CURL_SOCKOPT_OK;
+#ifdef TCP_USER_TIMEOUT
+  const unsigned user_timeout_ms = kTcpUserTimeoutMs;
+  setsockopt(curlfd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout_ms,
+             sizeof(user_timeout_ms));
+#endif
+#ifdef TCP_KEEPCNT
+  const int keepalive_probes = kTcpKeepaliveProbes;
+  setsockopt(curlfd, IPPROTO_TCP, TCP_KEEPCNT, &keepalive_probes,
+             sizeof(keepalive_probes));
+#endif
+  return CURL_SOCKOPT_OK;
+}
+
+
+/**
+ * Thin wrapper so the unit tests can exercise the socket options that libcurl
+ * would otherwise only apply from inside a live connection attempt.
+ */
+int CallbackCurlSockoptForTest(void *clientp, curl_socket_t curlfd,
+                               curlsocktype purpose) {
+  return CallbackCurlSockopt(clientp, curlfd, purpose);
+}
+
+
 CURL *DownloadManager::AcquireCurlHandle() {
   CURL *handle;
 
@@ -928,6 +997,7 @@ CURL *DownloadManager::AcquireCurlHandle() {
     // curl_easy_setopt(curl_default, CURLOPT_FAILONERROR, 1);
     curl_easy_setopt(handle, CURLOPT_HEADERFUNCTION, CallbackCurlHeader);
     curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, CallbackCurlData);
+    curl_easy_setopt(handle, CURLOPT_SOCKOPTFUNCTION, CallbackCurlSockopt);
   } else {
     handle = *(pool_handles_idle_->begin());
     pool_handles_idle_->erase(pool_handles_idle_->begin());
@@ -943,7 +1013,7 @@ void DownloadManager::ReleaseCurlHandle(CURL *handle, bool allow_reuse) {
   const set<CURL *>::iterator elem = pool_handles_inuse_->find(handle);
   assert(elem != pool_handles_inuse_->end());
 
-  if (!allow_reuse || pool_handles_idle_->size() > pool_max_handles_) {
+  if (!allow_reuse || (pool_handles_idle_->size() >= pool_max_handles_)) {
     curl_easy_cleanup(*elem);
   } else {
     pool_handles_idle_->insert(*elem);
@@ -958,6 +1028,28 @@ void DownloadManager::ReleaseCurlHandle(CURL *handle, bool allow_reuse) {
  * bytes arrived, and such a resume does not count against the retry budget.
  */
 static const curl_off_t kMinResumeProgress = 8 * 1024;
+
+/**
+ * Idle time after which an established connection starts emitting TCP
+ * keep-alive probes, and the longest a connection may sit idle before it is
+ * considered unfit for reuse.
+ *
+ * Both exist for the same reason.  A stateful middlebox -- conntrack, NAT, a
+ * DPI box -- drops its record of a flow that has been quiet for a while.  Once
+ * that record is gone, the peer's eventual FIN or RST no longer matches an
+ * established connection, so a firewall that only admits RELATED,ESTABLISHED
+ * discards the teardown packet.  The client is then left holding a socket that
+ * is dead but looks open, and only finds out by spending a whole request
+ * timeout on it -- which in turn burns the proxy and fails over away from a
+ * perfectly healthy one.
+ *
+ * Probing well inside the usual idle budgets keeps the flow on the books, so
+ * the teardown is delivered instead of filtered; refusing to reuse a
+ * long-idle connection bounds the damage when it is filtered anyway.
+ */
+static const unsigned kDefaultTcpKeepaliveSecs = 30;
+static const long kMaxIdleConnectionReuseSecs = 30;  // NOLINT
+
 
 /**
  * Byte range of the request: the caller's range (external files) shifted by
@@ -1136,8 +1228,20 @@ void DownloadManager::SetUrlOptions(JobInfo *info) {
 
     ProxyInfo *proxy = ChooseProxyUnlocked(info->expected_hash());
     if (!proxy || (proxy->url == "DIRECT")) {
-      info->SetProxy("DIRECT");
-      curl_easy_setopt(info->curl_handle(), CURLOPT_PROXY, "");
+      if (opt_proxy_mandatory_) {
+        // Every configured proxy is currently unusable.  Connecting directly
+        // would bypass the site proxy, so fail the request and let the normal
+        // retry/backoff path report the outage.
+        LogCvmfs(kLogDownload, kLogSyslogErr | kLogDebug,
+                 "(manager '%s' - id %" PRId64 ") "
+                 "no usable proxy available, refusing to connect directly",
+                 name_.c_str(), info->id());
+        info->SetProxy("BLOCKED");
+        curl_easy_setopt(info->curl_handle(), CURLOPT_PROXY, "0.0.0.0:1");
+      } else {
+        info->SetProxy("DIRECT");
+        curl_easy_setopt(info->curl_handle(), CURLOPT_PROXY, "");
+      }
     } else {
       // Note: inside ValidateProxyIpsUnlocked() we may change the proxy data
       // structure, so we must not pass proxy->... (== current_proxy())
@@ -1176,6 +1280,13 @@ void DownloadManager::SetUrlOptions(JobInfo *info) {
   } else {
     curl_easy_setopt(curl_handle, CURLOPT_TCP_KEEPALIVE, 0L);
   }
+#if LIBCURL_VERSION_NUM >= 0x074100  // 7.65.0
+  // libcurl's own default is ~2 minutes, which outlives the idle timeout of a
+  // typical middlebox; a connection it has already forgotten must not be
+  // picked up again.
+  curl_easy_setopt(curl_handle, CURLOPT_MAXAGE_CONN,
+                   kMaxIdleConnectionReuseSecs);
+#endif
   if (opt_fresh_connect_until_ > 0) {
     if (now == 0)
       now = time(NULL);
@@ -1265,11 +1376,14 @@ void DownloadManager::SetUrlOptions(JobInfo *info) {
       if (opt_proxy_groups_current_ >= opt_proxy_groups_fallback_) {
         // It doesn't make sense to use the fallback proxies in Geo-API requests
         // since the fallback proxies are supposed to get sorted, too.
-        info->SetProxy("DIRECT");
-        curl_easy_setopt(info->curl_handle(), CURLOPT_PROXY, "");
+        if (!opt_proxy_mandatory_) {
+          info->SetProxy("DIRECT");
+          curl_easy_setopt(info->curl_handle(), CURLOPT_PROXY, "");
+        }
         replacement = proxy_template_direct_;
       } else {
-        replacement = ChooseProxyUnlocked(info->expected_hash())->host.name();
+        const ProxyInfo *proxy = ChooseProxyUnlocked(info->expected_hash());
+        replacement = proxy ? proxy->host.name() : proxy_template_direct_;
       }
     }
     replacement = (replacement == "") ? proxy_template_direct_ : replacement;
@@ -2150,7 +2264,7 @@ DownloadManager::DownloadManager(const unsigned max_pool_handles,
     , opt_timeout_proxy_(5)
     , opt_timeout_direct_(10)
     , opt_low_speed_limit_(1024)
-    , opt_tcp_keepalive_(0)
+    , opt_tcp_keepalive_(kDefaultTcpKeepaliveSecs)
     , opt_parallel_fetch_(0)
     , opt_fresh_connect_until_(0)
     , opt_max_retries_(0)
@@ -2170,6 +2284,7 @@ DownloadManager::DownloadManager(const unsigned max_pool_handles,
     , opt_proxy_groups_current_burned_(0)
     , opt_proxy_groups_fallback_(0)
     , opt_num_proxies_(0)
+    , opt_proxy_mandatory_(false)
     , opt_proxy_shard_(false)
     , failover_indefinitely_(false)
     , name_(name)
@@ -3274,6 +3389,55 @@ bool DownloadManager::ValidateGeoReply(const string &reply_order,
  * Removes DIRECT from a list of ';' and '|' separated proxies.
  * \return true if DIRECT was present, false otherwise
  */
+/**
+ * Keeps DIRECT as a failover tier of its own but never as a peer of a real
+ * proxy.
+ *
+ * "proxy;DIRECT" is the documented way of asking for "use the proxy, and only
+ * if it has failed connect directly".  Load-balance groups, however, are
+ * chosen from at random, so a DIRECT sharing a group with a real proxy
+ * ("proxy|DIRECT") would send a share of the traffic unproxied while the
+ * proxy is perfectly healthy.  DIRECT is therefore dropped from any group that
+ * also holds a real proxy, and kept when it forms a group on its own.  Because
+ * proxy groups are tried in order, the surviving DIRECT group is only reached
+ * after every proxy in the preceding groups has been burned.
+ *
+ * *has_direct_group is set when such a DIRECT-only group survives.
+ */
+string DownloadManager::DemoteDirect(const string &proxy_list,
+                                     bool *has_direct_group) {
+  assert(has_direct_group);
+  *has_direct_group = false;
+  if (proxy_list == "")
+    return "";
+
+  const vector<string> groups = SplitString(proxy_list, ';');
+  vector<string> kept_groups;
+  for (unsigned i = 0; i < groups.size(); ++i) {
+    const vector<string> members = SplitString(groups[i], '|');
+    vector<string> real_members;
+    bool group_has_direct = false;
+    for (unsigned j = 0; j < members.size(); ++j) {
+      if (members[j] == "DIRECT") {
+        group_has_direct = true;
+        continue;
+      }
+      if (members[j] == "")
+        continue;
+      real_members.push_back(members[j]);
+    }
+    if (!real_members.empty()) {
+      kept_groups.push_back(JoinStrings(real_members, "|"));
+    } else if (group_has_direct) {
+      kept_groups.push_back("DIRECT");
+      *has_direct_group = true;
+    }
+  }
+
+  return JoinStrings(kept_groups, ";");
+}
+
+
 bool DownloadManager::StripDirect(const string &proxy_list,
                                   string *cleaned_list) {
   assert(cleaned_list);
@@ -3335,15 +3499,27 @@ void DownloadManager::SetProxyChain(const string &proxy_list,
              "(manager '%s') fallback proxies do not support DIRECT, removing",
              name_.c_str());
   }
-  if (set_proxy_fallback_list == "") {
-    set_proxy_list = opt_proxy_list_;
-  } else {
-    const bool contains_direct = StripDirect(opt_proxy_list_, &set_proxy_list);
-    if (contains_direct) {
-      LogCvmfs(kLogDownload, kLogSyslog | kLogDebug,
-               "(manager '%s') skipping DIRECT proxy to use fallback proxy",
-               name_.c_str());
-    }
+  // Keep a DIRECT tier if one was configured, but never let DIRECT compete
+  // with a healthy proxy inside a load-balance group.  Unlike the previous
+  // behaviour, a configured DIRECT is no longer discarded merely because
+  // fallback proxies also exist: "proxy;DIRECT" keeps meaning "use the proxy,
+  // and connect directly only once it has failed".
+  bool has_direct_group = false;
+  set_proxy_list = DemoteDirect(opt_proxy_list_, &has_direct_group);
+  if (set_proxy_list != opt_proxy_list_) {
+    LogCvmfs(kLogDownload, kLogSyslog | kLogDebug,
+             "(manager '%s') proxy chain '%s' normalised to '%s': DIRECT is "
+             "only used as a last resort, never alongside a live proxy",
+             name_.c_str(), opt_proxy_list_.c_str(), set_proxy_list.c_str());
+  }
+
+  // Direct connections are forbidden only when nothing asked for them.
+  {
+    string probe;
+    StripDirect(set_proxy_list, &probe);
+    const bool have_real_proxy = (probe != "")
+                                 || (set_proxy_fallback_list != "");
+    opt_proxy_mandatory_ = have_real_proxy && !has_direct_group;
   }
 
   // From this point on, use set_proxy_list and set_fallback_proxy_list as
@@ -3511,6 +3687,8 @@ DownloadManager::ProxyInfo *DownloadManager::ChooseProxyUnlocked(
   const uint32_t key = (hash ? hash->Partial32() : 0);
   const map<uint32_t, ProxyInfo *>::iterator it = opt_proxy_map_.lower_bound(
       key);
+  if (it == opt_proxy_map_.end())
+    return NULL;
   ProxyInfo *proxy = it->second;
 
   return proxy;
@@ -3525,6 +3703,10 @@ void DownloadManager::UpdateProxiesUnlocked(const string &reason) {
 
   // Identify number of non-burned proxies within the current group
   vector<ProxyInfo> *group = current_proxy_group();
+  if ((group == NULL) || group->empty()
+      || (opt_proxy_groups_current_burned_ >= group->size())) {
+    return;
+  }
   const unsigned num_alive = (group->size() - opt_proxy_groups_current_burned_);
   const string old_proxy = JoinStrings(opt_proxies_, "|");
 
@@ -3550,6 +3732,8 @@ void DownloadManager::UpdateProxiesUnlocked(const string &reason) {
       opt_proxies_.push_back(proxy->url + proxy_name);
     }
     // Ensure lower_bound() finds a value for all keys
+    if (opt_proxy_map_.empty())
+      return;
     ProxyInfo *first_proxy = opt_proxy_map_.begin()->second;
     const std::pair<uint32_t, ProxyInfo *> last_entry(max_key, first_proxy);
     opt_proxy_map_.insert(last_entry);
@@ -3772,6 +3956,7 @@ void DownloadManager::CloneProxyConfig(DownloadManager *clone) {
   clone->opt_proxy_groups_current_ = opt_proxy_groups_current_;
   clone->opt_proxy_groups_current_burned_ = opt_proxy_groups_current_burned_;
   clone->opt_proxy_groups_fallback_ = opt_proxy_groups_fallback_;
+  clone->opt_proxy_mandatory_ = opt_proxy_mandatory_;
   clone->opt_num_proxies_ = opt_num_proxies_;
   clone->opt_proxy_shard_ = opt_proxy_shard_;
   clone->opt_proxy_list_ = opt_proxy_list_;
