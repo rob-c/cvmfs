@@ -1272,6 +1272,32 @@ TEST_F(T_Download, RefusedConnectGetsExtraCheapRetries) {
 }
 
 
+TEST_F(T_Download, TimeoutQuarantinesThePooledConnections) {
+  // After a timeout the manager arms opt_fresh_connect_until_, so that for one
+  // timeout period every request opens its own connection instead of reaching
+  // for a pooled one.  A middlebox that has silently dropped an idle flow
+  // leaves no trace on the pooled socket, so reusing it would burn another
+  // full timeout; this is what stops that repeating.
+  EXPECT_EQ(0, download_mgr.opt_fresh_connect_until_);
+
+  download_mgr.SetProxyChain("http://192.0.2.1:3128", "",
+                             DownloadManager::kSetProxyBoth);
+  download_mgr.SetRetryParameters(0, 0, 0);
+  download_mgr.SetTimeout(2, 2);
+
+  const string url = "http://127.0.0.1:8117/object";
+  cvmfs::MemSink sink;
+  JobInfo info(&url, false, false, NULL, &sink);
+  const time_t before = time(NULL);
+  download_mgr.Fetch(&info);
+
+  EXPECT_EQ(kFailProxyTooSlow, info.error_code());
+  EXPECT_TRUE(info.peer_unresponsive());
+  EXPECT_GE(download_mgr.opt_fresh_connect_until_, before)
+      << "a timeout did not quarantine the connection pool";
+}
+
+
 TEST_F(T_Download, ValidateGeoReply) {
   vector<uint64_t> geo_order;
   EXPECT_FALSE(download_mgr.ValidateGeoReply("", geo_order.size(), &geo_order));
