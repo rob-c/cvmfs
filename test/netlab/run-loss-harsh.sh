@@ -3,11 +3,13 @@
 # exercises teardown and retry: one connection in ten is severed mid-transfer.
 HERE=$(cd "$(dirname "$0")" && pwd)
 LAB=${LAB:-/var/tmp/cvmfs-losslab}
-L=$LAB; REPO=grid.cern.ch; OUT=$L/log/loss25harsh; mkdir -p $OUT
+L=$LAB; REPO=grid.cern.ch; LOSS=${1:-0.25}; LABEL=${2:-loss${LOSS}harsh}
+OUT=$L/log/$LABEL; mkdir -p $OUT
 fusermount -u $L/mnt 2>/dev/null; sleep 1
 kill $(cat $L/relay.pid 2>/dev/null) 2>/dev/null; sleep 1
 rm -rf $L/cache; mkdir -p $L/cache
-python3 $HERE/lossrelay.py --loss 0.25 --reset-prob 0.35 --stall-prob 0.03 --report 10 \
+: > $L/log/cvmfs.log            # proxy transitions land here, not in ss
+python3 $HERE/lossrelay.py --loss $LOSS --reset-prob 0.35 --stall-prob 0.03 --report 10 \
    --listen 3129 --target 194.81.255.225:3128 > $OUT/relay.log 2>&1 &
 echo $! > $L/relay.pid; sleep 1
 cvmfs2 -o config=$L/cvmfs.conf,allow_other $REPO $L/mnt > $OUT/mount.log 2>&1
@@ -25,6 +27,12 @@ B=$(cat $OUT/w*.out | grep -E '^[0-9]+$' | paste -sd+ | python3 -c 'import sys;p
   cvmfs_talk -p $L/cache/$REPO/cvmfs_io.$REPO internal affairs 2>/dev/null | grep -Ei 'n_requests|n_retries|failover|n_proxy'
   cvmfs_talk -p $L/cache/$REPO/cvmfs_io.$REPO proxy info 2>/dev/null | head -8
 } | tee -a $OUT/summary
+echo "--- proxy/host transitions (client log) ---"
+grep -Ei "switch|proxy|host|fail|timeout" $L/log/cvmfs.log | tail -20 | tee $OUT/transitions
+cp $L/log/cvmfs.log $OUT/cvmfs.log 2>/dev/null
+echo "--- proxy/host transitions (client log) ---"
+grep -Ei "switch|proxy|host|fail|timeout" $L/log/cvmfs.log | tail -20 | tee -a $OUT/summary
+cp $L/log/cvmfs.log $OUT/cvmfs.log 2>/dev/null
 tail -3 $OUT/relay.log
 fusermount -u $L/mnt 2>/dev/null; kill $(cat $L/relay.pid) 2>/dev/null
 echo HARSH_DONE

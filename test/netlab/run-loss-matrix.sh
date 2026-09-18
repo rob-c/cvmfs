@@ -10,6 +10,7 @@ fusermount -u $L/mnt 2>/dev/null; sleep 1
 pkill -x lossrelay.py 2>/dev/null
 kill $(cat $L/relay.pid 2>/dev/null) 2>/dev/null; sleep 1
 rm -rf $L/cache; mkdir -p $L/cache
+: > $L/log/cvmfs.log            # proxy transitions land here, not in ss
 
 python3 $HERE/lossrelay.py --loss $LOSS --listen 3129 \
     --target 194.81.255.225:3128 > $OUT/relay.log 2>&1 &
@@ -50,4 +51,7 @@ cvmfs_talk -p $L/cache/$REPO/cvmfs_io.$REPO internal affairs 2>/dev/null \
 echo "--- proxy in use ---"
 cvmfs_talk -p $L/cache/$REPO/cvmfs_io.$REPO proxy info 2>/dev/null | head -20
 } | tee -a $OUT/summary
+echo "--- proxy/host transitions (client log) ---"
+grep -Ei "switch|proxy|host|fail|timeout" $L/log/cvmfs.log | tail -20 | tee $OUT/transitions
+cp $L/log/cvmfs.log $OUT/cvmfs.log 2>/dev/null
 tail -3 $OUT/relay.log

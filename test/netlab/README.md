@@ -47,7 +47,14 @@ anyway.
 ## Drivers
 
     ./run-loss-matrix.sh <fraction> <label>   # one cold-cache mount + 400-file read
-    ./run-loss-harsh.sh                       # 25% loss + forced mid-transfer RSTs
+    ./run-loss-harsh.sh <fraction> <label>    # same, plus forced mid-transfer RSTs
+
+To sweep, drive the first one in a loop; RESULTS.md was produced with
+
+    for p in 0 0.05 0.10 0.25 0.35 0.50; do ./run-loss-matrix.sh $p loss$p; done
+    ./run-loss-harsh.sh 0.50 loss50harsh
+
+The 50% run takes about 8 minutes for the read sweep alone, so run it detached.
 
 Both use a **private** mount (`CVMFS_CACHE_BASE` under `$LAB`, default
 `/var/tmp/cvmfs-losslab`) pointed at the relay, so the host's production mounts
@@ -58,7 +65,12 @@ keep talking to the proxy directly and are unaffected.
 The pass conditions are not "it was fast".  They are:
 
 1. byte counts identical to the zero-loss baseline (correctness), and
-2. `download.n_proxy_failover` and `download.n_host_failover` both **0**.
+2. `download.n_proxy_failover` and `download.n_host_failover` both **0**, and
+3. no second `switching proxy` line in `$LAB/log/cvmfs.log` after the two
+   emitted at startup.
+
+Check (3) from the client's own log rather than by polling `ss`; a transition
+can come and go between polls, and the log is authoritative.
 
 (2) is the important one.  A lossy proxy is slow but *reachable*, and the
 escalation gate in `download.cc` keys on connectivity rather than throughput
