@@ -24,6 +24,7 @@
 #include "network/sink_file.h"
 #include "statistics.h"
 #include "util/file_guard.h"
+#include "util/platform.h"
 #include "util/posix.h"
 #include "util/smalloc.h"
 #include "util/prng.h"
@@ -1295,6 +1296,50 @@ TEST_F(T_Download, TimeoutQuarantinesThePooledConnections) {
   EXPECT_TRUE(info.peer_unresponsive());
   EXPECT_GE(download_mgr.opt_fresh_connect_until_, before)
       << "a timeout did not quarantine the connection pool";
+}
+
+
+TEST_F(T_Download, BackoffDefersInsteadOfSleepingWhenThreaded) {
+  // With one I/O thread serving every transfer of a manager, sleeping out a
+  // retry there stalls all of them behind the slowest one.  In multi-threaded
+  // mode Backoff() therefore records when the job may run again and returns at
+  // once, leaving MainDownload to re-queue it; single-threaded, where the
+  // sleep only costs the caller its own transfer, it still sleeps.
+  //
+  // This is asserted on the mechanism rather than on wall-clock behaviour: the
+  // first backoff is prng_.Next(init + 1), so its length is not predictable
+  // enough to time reliably.  Note also that a short transfer deliberately
+  // takes a 10-100 ms jitter instead of the exponential path, so the error
+  // code here is a timeout.
+  const string url = "http://127.0.0.1:8122/object";
+  cvmfs::MemSink sink;
+  download_mgr.SetRetryParameters(2, 1000, 1000);
+
+  JobInfo single(&url, false, false, NULL, &sink);
+  single.SetErrorCode(kFailHostTooSlow);
+  const uint64_t t0 = platform_monotonic_time_ns() / 1000000;
+  download_mgr.Backoff(&single);
+  const uint64_t slept_ms = (platform_monotonic_time_ns() / 1000000) - t0;
+  EXPECT_EQ(0U, single.retry_not_before_ms())
+      << "a single-threaded backoff should not defer";
+  EXPECT_GT(single.backoff_ms(), 0U);
+  // It really did wait, give or take the clock granularity.
+  EXPECT_GE(slept_ms + 20, static_cast<uint64_t>(single.backoff_ms()));
+
+  download_mgr.Spawn();   // multi-threaded from here
+
+  JobInfo threaded(&url, false, false, NULL, &sink);
+  threaded.SetErrorCode(kFailHostTooSlow);
+  const uint64_t t1 = platform_monotonic_time_ns() / 1000000;
+  download_mgr.Backoff(&threaded);
+  const uint64_t elapsed_ms = (platform_monotonic_time_ns() / 1000000) - t1;
+
+  EXPECT_LT(elapsed_ms, 100U)
+      << "Backoff() slept on the I/O thread for " << elapsed_ms << " ms";
+  EXPECT_GE(threaded.retry_not_before_ms(), t1)
+      << "the job was not deferred to a later time";
+  EXPECT_LE(threaded.retry_not_before_ms(),
+            t1 + threaded.backoff_ms() + 50);
 }
 
 
