@@ -83,6 +83,7 @@ void JobInfo::Init() {
   retry_not_before_ms_ = 0;
   no_progress_since_ms_ = 0;
   parallel_ok_ = false;
+  peer_unresponsive_ = false;
   resume_offset_ = 0;
   content_length_ = -1;
   current_metalink_chain_index_ = -1;

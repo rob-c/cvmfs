@@ -1797,6 +1797,17 @@ bool DownloadManager::VerifyAndFinalize(const int curl_error, JobInfo *info) {
       info->SetErrorCode(kFailHostResolve);
       break;
     case CURLE_OPERATION_TIMEDOUT: {
+      // A timeout means one of two opposite things.  If the connection never
+      // came up, nobody answered: the peer is unreachable, which is exactly
+      // the case that justifies looking elsewhere.  If it did come up and the
+      // transfer then crawled, the peer is alive and merely saturated, and
+      // abandoning it would move traffic off-site for no good reason.
+      // CURLINFO_CONNECT_TIME_T stays zero while the connect has not
+      // completed, so it separates the two.
+      curl_off_t connect_time = 0;
+      curl_easy_getinfo(info->curl_handle(), CURLINFO_CONNECT_TIME_T,
+                        &connect_time);
+      info->SetPeerUnresponsive(connect_time == 0);
       info->SetErrorCode((info->proxy() == "DIRECT") ? kFailHostTooSlow
                                                      : kFailProxyTooSlow);
       // Quarantine the connection pool for one timeout period (see
@@ -1816,6 +1827,11 @@ bool DownloadManager::VerifyAndFinalize(const int curl_error, JobInfo *info) {
       break;
     case CURLE_FILE_COULDNT_READ_FILE:
     case CURLE_COULDNT_CONNECT:
+      // A refused connection comes back in about a round trip and proves that
+      // something is listening and actively rejecting -- a proxy out of slots,
+      // not a dead one.  It is the opposite of unresponsive, so retry it here
+      // rather than treating it as grounds to leave the local proxy.
+      info->SetPeerUnresponsive(false);
       if (info->proxy() != "DIRECT") {
         // This is a guess.  Fail-over can still change to switching host
         info->SetErrorCode(kFailProxyConnection);
@@ -2968,8 +2984,13 @@ void DownloadManager::SwitchProxy(JobInfo *info) {
       // Stay on the group instead; the burn counter has just been cleared, so
       // the proxy is usable again and the normal retry and backoff path
       // decides whether the request ultimately fails.
-      const bool proxy_unreachable = (info->error_code()
-                                      == kFailProxyConnection)
+      // Only a peer that never answered, or one whose name no longer
+      // resolves, is grounds for leaving the local proxy.  Note this is not
+      // the same as kFailProxyConnection: libcurl reports a refused connect
+      // as CURLE_COULDNT_CONNECT but an unanswered one as
+      // CURLE_OPERATION_TIMEDOUT, so keying on the error code alone gets both
+      // cases exactly backwards.
+      const bool proxy_unreachable = info->peer_unresponsive()
                                      || (info->error_code()
                                          == kFailProxyResolve);
       const bool would_escalate = IsEscalatedProxyGroup(next_group)

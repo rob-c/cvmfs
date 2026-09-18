@@ -592,15 +592,18 @@ TEST_F(T_Download, ProxyHealthyProxyIsUsedNotDirect) {
 }
 
 
-TEST_F(T_Download, ProxyDirectUsedOnlyAfterProxyFails) {
-  // Same chain, but the proxy is down: the DIRECT tier must rescue the
-  // request rather than leaving the client stuck.
+TEST_F(T_Download, UnresponsiveProxyEscalatesToDirect) {
+  // A proxy that never answers the connect is genuinely unreachable, which is
+  // what the DIRECT tier exists for.  192.0.2.0/24 is TEST-NET-1 from RFC
+  // 5737: it is not routed, so the connect runs out of time rather than being
+  // refused, and CURLINFO_CONNECT_TIME_T stays zero.
   string src_path = GetSmallFile();
   MockFileServer file_server(8096, sandbox_path_);
 
-  // Nothing listens on 8097.
-  download_mgr.SetProxyChain("http://127.0.0.1:8097;DIRECT", "",
+  download_mgr.SetProxyChain("http://192.0.2.1:3128;DIRECT", "",
                              DownloadManager::kSetProxyBoth);
+  download_mgr.SetRetryParameters(1, 0, 0);
+  download_mgr.SetTimeout(2, 2);
 
   string src_url = "http://127.0.0.1:8096/" + GetFileName(src_path);
   cvmfs::MemSink memsink;
@@ -611,6 +614,33 @@ TEST_F(T_Download, ProxyDirectUsedOnlyAfterProxyFails) {
   EXPECT_EQ(kFailOk, info.error_code());
   EXPECT_EQ("DIRECT", info.proxy());
   EXPECT_EQ(1, file_server.num_processed_requests());
+}
+
+
+TEST_F(T_Download, RefusedProxyDoesNotEscalateToDirect) {
+  // The converse, and the case libcurl makes easy to get wrong: a refused
+  // connect is reported as CURLE_COULDNT_CONNECT while an unanswered one is
+  // CURLE_OPERATION_TIMEDOUT, so keying on the error code alone treats a
+  // proxy that is merely out of slots as though it were dead.  Nothing
+  // listens on 8097, so the kernel refuses at once -- proof that the host is
+  // up -- and the DIRECT tier must stay unused.
+  string src_path = GetSmallFile();
+  MockFileServer file_server(8098, sandbox_path_);
+
+  download_mgr.SetProxyChain("http://127.0.0.1:8097;DIRECT", "",
+                             DownloadManager::kSetProxyBoth);
+  download_mgr.SetRetryParameters(1, 0, 0);
+  download_mgr.SetTimeout(2, 2);
+
+  string src_url = "http://127.0.0.1:8098/" + GetFileName(src_path);
+  cvmfs::MemSink memsink;
+  JobInfo info(&src_url, false, false, NULL, &memsink);
+  download_mgr.Fetch(&info);
+
+  EXPECT_EQ(kFailProxyConnection, info.error_code());
+  EXPECT_FALSE(info.peer_unresponsive());
+  EXPECT_NE("DIRECT", info.proxy());
+  EXPECT_EQ(0, file_server.num_processed_requests());
 }
 
 
@@ -1210,6 +1240,35 @@ TEST_F(T_Download, SlowProxyDoesNotEscalateToFallback) {
   EXPECT_EQ(0, origin.num_processed_requests());
   slow_proxy.Stop();
   fallback_proxy.Stop();
+}
+
+
+TEST_F(T_Download, RefusedConnectGetsExtraCheapRetries) {
+  // A refused connection returns at once, so CanRetry()'s extended budget --
+  // "keep retrying while the attempts without progress have not yet cost one
+  // timeout period" -- should grant several attempts beyond max_retries before
+  // the proxy is written off.  A dead peer that times out on each attempt
+  // consumes that budget immediately instead.
+  //
+  // Nothing listens on 8115, and the kernel refuses instantly.  Measured with
+  // these parameters: 3 attempts spread over ~7.7s.  With backoff disabled the
+  // same budget allows ~163 attempts inside one 3s period, which is what makes
+  // the rule "cheap failures are worth repeating" rather than a fixed count.
+  download_mgr.SetProxyChain("http://127.0.0.1:8115", "",
+                             DownloadManager::kSetProxyBoth);
+  download_mgr.SetRetryParameters(1, 2000, 10000);  // stock-like backoff
+  download_mgr.SetTimeout(5, 5);
+
+  const string url = "http://127.0.0.1:8116/object";
+  cvmfs::MemSink sink;
+  JobInfo info(&url, false, false, NULL, &sink);
+  download_mgr.Fetch(&info);
+
+  EXPECT_EQ(kFailProxyConnection, info.error_code());
+  // Strictly more attempts than the nominal single retry: that extra is the
+  // cheap-failure budget in CanRetry(), not the max_retries allowance.
+  EXPECT_GT(static_cast<int>(info.num_retries()), 1)
+      << "a refused connect was written off after the nominal retry budget";
 }
 
 

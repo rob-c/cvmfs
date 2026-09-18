@@ -117,6 +117,7 @@ class JobInfo {
   uint64_t no_progress_since_ms_;
   /** Large single objects may be fetched as parallel ranges (catalogs) */
   bool parallel_ok_;
+  bool peer_unresponsive_;
   int current_metalink_chain_index_;
   int current_host_chain_index_;
 
@@ -223,6 +224,13 @@ class JobInfo {
   uint64_t retry_not_before_ms() const { return retry_not_before_ms_; }
   uint64_t no_progress_since_ms() const { return no_progress_since_ms_; }
   bool parallel_ok() const { return parallel_ok_; }
+  /**
+   * True when the failure means the peer never answered at all: the connect
+   * ran out of time without completing.  A refused connection does not count
+   * -- the peer answered, with a reset -- and neither does a connection that
+   * was established and then ran slowly.
+   */
+  bool peer_unresponsive() const { return peer_unresponsive_; }
   int current_metalink_chain_index() const {
     return current_metalink_chain_index_;
   }
@@ -290,6 +298,7 @@ class JobInfo {
   void SetRetryNotBeforeMs(uint64_t t) { retry_not_before_ms_ = t; }
   void SetNoProgressSinceMs(uint64_t t) { no_progress_since_ms_ = t; }
   void SetParallelOk(bool ok) { parallel_ok_ = ok; }
+  void SetPeerUnresponsive(bool v) { peer_unresponsive_ = v; }
   void SetCurrentMetalinkChainIndex(int current_metalink_chain_index) {
     current_metalink_chain_index_ = current_metalink_chain_index;
   }
