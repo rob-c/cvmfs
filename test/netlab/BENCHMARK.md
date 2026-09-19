@@ -59,12 +59,43 @@ reliably faster under loss.  Anyone wanting to claim a difference at 50% in the
 
 ## The one reproducible difference
 
-| arm    | runs | switched to DIRECT | never switched |
-|--------|-----:|-------------------:|---------------:|
-| stock  |   19 |             **19** |              0 |
-| branch |   19 |              **0** |             19 |
+Broken down by loss level (`analyse-bylevel.py`):
 
-Deterministic, at every loss level including 0%, and **in both configs** --
+| loss | arm    | runs | switched to DIRECT | never | % of runs | proxy-only cfg | `;DIRECT` cfg |
+|-----:|--------|-----:|-------------------:|------:|----------:|---------------:|--------------:|
+|   0% | stock  |    9 |              **9** |     0 |      100% |            7/7 |           2/2 |
+|   0% | branch |    8 |              **0** |     8 |        0% |            0/7 |           0/1 |
+|  25% | stock  |    2 |              **2** |     0 |      100% |            1/1 |           1/1 |
+|  25% | branch |    2 |              **0** |     2 |        0% |            0/1 |           0/1 |
+|  50% | stock  |    8 |              **8** |     0 |      100% |            5/5 |           3/3 |
+|  50% | branch |    9 |              **0** |     9 |        0% |            0/5 |           0/4 |
+| **all** | **stock**  | **19** | **19 (100%)** | **0** | | **13/13** | **6/6** |
+| **all** | **branch** | **19** |  **0 (0%)**   | **19**| |  **0/13** | **0/6** |
+
+Supporting metrics for the same runs.  Ranges matter more than means here: they
+overlap at every level, which is why no throughput difference is claimed.
+
+| loss | arm    | runs | mount s (mean [range])  | read s (mean [range])   | payload | retries | proxy failovers | off-proxy bytes |
+|-----:|--------|-----:|-------------------------|-------------------------|---------|--------:|----------------:|----------------:|
+|   0% | stock  |    9 | 0.21 [0.20-0.22]        | 1.59 [1.45-1.73]        | all OK  |       0 |               0 |        0 (none) |
+|   0% | branch |    8 | 0.21 [0.20-0.22]        | 1.66 [1.52-2.17]        | all OK  |       0 |               0 |        0 (none) |
+|  25% | stock  |    2 | 5.43 [4.93-5.93]        | 8.62 [7.37-9.88]        | all OK  |       0 |               0 |        0 (none) |
+|  25% | branch |    2 | 5.20 [4.37-6.03]        | 7.06 [6.81-7.31]        | all OK  |       0 |               0 |        0 (none) |
+|  50% | stock  |    8 | 38.99 [32.87-46.07]     | 35.13 [29.67-45.64]     | all OK  |       4 |               0 |        0 (none) |
+|  50% | branch |    9 | 41.68 [31.34-54.49]     | 38.69 [29.82-55.37]     | all OK  |       7 |               0 |        0 (none) |
+
+"off-proxy bytes" is `sz_transferred_bytes` minus the relay's byte count, floored
+at zero: the raw figure is about -339,000 in every run because the relay also
+counts HTTP headers and both directions, which is the signature of *everything*
+having gone through the proxy.
+
+Run counts are uneven because the replication was targeted where single samples
+disagreed (n=5 at 0% proxy-only, n=4 at 50% proxy-only, n=3 at 50% `;DIRECT`),
+and 25% was only ever run once per config.  The DIRECT result needs no
+replication: it is 19/19 versus 0/19 with no variance at all.
+
+The switch is deterministic at every loss level including 0%, and **in both
+configs** --
 including proxy-only, where the config names no DIRECT fallback at all.  Stock
 logs:
 
@@ -111,7 +142,8 @@ manager fix, not the `SwitchProxy` gate.
 ## Reproducing
 
     LAB=/var/tmp/cvmfs-losslab ./bench-ab.sh <tree> <config> <loss> <label> [relay-args]
-    LAB=/var/tmp/cvmfs-losslab ./analyse-ab.py
+    LAB=/var/tmp/cvmfs-losslab ./analyse-ab.py        # per-cell table
+    LAB=/var/tmp/cvmfs-losslab ./analyse-bylevel.py   # aggregated by loss level
 
 where `<tree>` is a source tree containing `build/cvmfs/`.  Labels beginning
 `ab-<arm>-<cfg>-<loss>` are what `analyse-ab.py` tabulates.
