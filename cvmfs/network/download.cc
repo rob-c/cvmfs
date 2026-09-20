@@ -138,6 +138,36 @@ static Failures PrepareDownloadDestination(JobInfo *info) {
 /**
  * Called by curl for every HTTP header. Not called for file:// transfers.
  */
+/**
+ * True when the TCP connect for this transfer completed, whatever happened
+ * afterwards.  It tells a peer that never answered apart from one that
+ * answered and then misbehaved, which is the difference between "look
+ * elsewhere" and "stay here".
+ *
+ * CURLINFO_CONNECT_TIME_T arrived in libcurl 7.61.0 but the build accepts
+ * 7.55.0 (see externals/libcurl/CMakeLists.txt), so fall back to the
+ * double-valued CURLINFO_CONNECT_TIME, which has been there since 7.4.1 and
+ * carries the same meaning at lower resolution.
+ */
+static bool ConnectCompleted(CURL *handle) {
+#if LIBCURL_VERSION_NUM >= 0x073d00  // 7.61.0
+  curl_off_t connect_time = 0;
+  if (curl_easy_getinfo(handle, CURLINFO_CONNECT_TIME_T, &connect_time)
+      != CURLE_OK) {
+    return false;
+  }
+  return connect_time > 0;
+#else
+  double connect_time = 0.0;
+  if (curl_easy_getinfo(handle, CURLINFO_CONNECT_TIME, &connect_time)
+      != CURLE_OK) {
+    return false;
+  }
+  return connect_time > 0.0;
+#endif
+}
+
+
 static size_t CallbackCurlHeader(void *ptr, size_t size, size_t nmemb,
                                  void *info_link) {
   const size_t num_bytes = size * nmemb;
@@ -1143,7 +1173,15 @@ void DownloadManager::InitializeRequest(JobInfo *info, CURL *handle) {
     shash::Init(info->hash_context());
   }
 
+  // Fetcher hands the same thread-local JobInfo back for the next
+  // object, so every per-transfer field has to be cleared here.  A
+  // stale peer_unresponsive_ in particular would let an unrelated
+  // later failure escalate away from the proxy.
   info->SetResumeOffset(0);
+  info->SetContentLength(-1);
+  info->SetPeerUnresponsive(false);
+  info->SetNoProgressSinceMs(0);
+  info->SetRetryNotBeforeMs(0);
   SetRangeOption(info, handle);
 
   // Set curl parameters
@@ -1794,10 +1832,7 @@ bool DownloadManager::VerifyAndFinalize(const int curl_error, JobInfo *info) {
       // (e.g. a middlebox injecting a plain-text block banner), which libcurl
       // rejects as HTTP/0.9.  That is a mangled transfer, not a bad URL, so
       // let the usual retry and proxy/host fail-over apply instead of EIO.
-      curl_off_t connect_time = 0;
-      curl_easy_getinfo(info->curl_handle(), CURLINFO_CONNECT_TIME_T,
-                        &connect_time);
-      if (connect_time > 0) {
+      if (ConnectCompleted(info->curl_handle())) {
         info->SetErrorCode((info->proxy() == "DIRECT")
                                ? kFailHostShortTransfer
                                : kFailProxyShortTransfer);
@@ -1821,12 +1856,9 @@ bool DownloadManager::VerifyAndFinalize(const int curl_error, JobInfo *info) {
       // the case that justifies looking elsewhere.  If it did come up and the
       // transfer then crawled, the peer is alive and merely saturated, and
       // abandoning it would move traffic off-site for no good reason.
-      // CURLINFO_CONNECT_TIME_T stays zero while the connect has not
-      // completed, so it separates the two.
-      curl_off_t connect_time = 0;
-      curl_easy_getinfo(info->curl_handle(), CURLINFO_CONNECT_TIME_T,
-                        &connect_time);
-      info->SetPeerUnresponsive(connect_time == 0);
+      // The connect time stays zero while the connect has not completed, so
+      // it separates the two; see ConnectCompleted().
+      info->SetPeerUnresponsive(!ConnectCompleted(info->curl_handle()));
       info->SetErrorCode((info->proxy() == "DIRECT") ? kFailHostTooSlow
                                                      : kFailProxyTooSlow);
       // Quarantine the connection pool for one timeout period (see
@@ -2475,6 +2507,10 @@ Failures DownloadManager::FetchParallel(JobInfo *info) {
     *(job->GetPidPtr()) = info->pid();
     *(job->GetUidPtr()) = info->uid();
     *(job->GetGidPtr()) = info->gid();
+    // Without these the CVMFS_INFO_HEADER shows "path=-" for every range and
+    // a cancellation is ignored until all range threads have finished.
+    job->SetPathInfo(info->path_info());
+    job->SetInterruptCue(info->interrupt_cue());
     sinks.push_back(sink);
     jobs.push_back(job);
     subs[i].mgr = this;

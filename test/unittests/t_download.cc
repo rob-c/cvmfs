@@ -833,41 +833,59 @@ TEST_F(T_Download, SocketTeardownIsBounded) {
   ASSERT_GE(fd, 0);
 
   // Defaults first: the kernel leaves TCP_USER_TIMEOUT unset (0 == use
-  // tcp_retries2) and keeps the system-wide probe count.
-  unsigned before_timeout = 1;
-  socklen_t len = sizeof(before_timeout);
-  ASSERT_EQ(0, getsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &before_timeout,
-                          &len));
-  EXPECT_EQ(0U, before_timeout);
+  // tcp_retries2) and keeps the system-wide probe count.  TCP_USER_TIMEOUT is
+  // Linux-specific and the production callback is guarded the same way, so
+  // this part of the test is skipped where the option does not exist.
+#ifdef TCP_USER_TIMEOUT
+  {
+    unsigned before_timeout = 1;
+    socklen_t len = sizeof(before_timeout);
+    ASSERT_EQ(0, getsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &before_timeout,
+                            &len));
+    EXPECT_EQ(0U, before_timeout);
+  }
+#endif
 
   // The callback libcurl invokes for every connection socket.
   ASSERT_EQ(CURL_SOCKOPT_OK,
             download::CallbackCurlSockoptForTest(NULL, fd, CURLSOCKTYPE_IPCXN));
 
-  unsigned user_timeout = 0;
-  len = sizeof(user_timeout);
-  ASSERT_EQ(0,
-            getsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout, &len));
-  EXPECT_GT(user_timeout, 0U);
-  // Well under the ~15 minutes tcp_retries2 would otherwise allow.
-  EXPECT_LE(user_timeout, 120000U);
+#ifdef TCP_USER_TIMEOUT
+  {
+    unsigned user_timeout = 0;
+    socklen_t len = sizeof(user_timeout);
+    ASSERT_EQ(0, getsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout,
+                            &len));
+    EXPECT_GT(user_timeout, 0U);
+    // Well under the ~15 minutes tcp_retries2 would otherwise allow.
+    EXPECT_LE(user_timeout, 120000U);
+  }
+#endif
 
-  int keepcnt = 0;
-  len = sizeof(keepcnt);
-  ASSERT_EQ(0, getsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, &len));
-  EXPECT_GT(keepcnt, 0);
-  EXPECT_LE(keepcnt, 5);
+#ifdef TCP_KEEPCNT
+  {
+    int keepcnt = 0;
+    socklen_t len = sizeof(keepcnt);
+    ASSERT_EQ(0, getsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, &len));
+    EXPECT_GT(keepcnt, 0);
+    EXPECT_LE(keepcnt, 5);
+  }
+#endif
 
   // Sockets that are not connection sockets must be left alone.
   const int fd2 = socket(AF_INET, SOCK_STREAM, 0);
   ASSERT_GE(fd2, 0);
   ASSERT_EQ(CURL_SOCKOPT_OK, download::CallbackCurlSockoptForTest(
                                  NULL, fd2, CURLSOCKTYPE_ACCEPT));
-  unsigned untouched = 1;
-  len = sizeof(untouched);
-  ASSERT_EQ(0,
-            getsockopt(fd2, IPPROTO_TCP, TCP_USER_TIMEOUT, &untouched, &len));
-  EXPECT_EQ(0U, untouched);
+#ifdef TCP_USER_TIMEOUT
+  {
+    unsigned untouched = 1;
+    socklen_t len = sizeof(untouched);
+    ASSERT_EQ(0,
+              getsockopt(fd2, IPPROTO_TCP, TCP_USER_TIMEOUT, &untouched, &len));
+    EXPECT_EQ(0U, untouched);
+  }
+#endif
 
   close(fd);
   close(fd2);
@@ -1316,6 +1334,11 @@ TEST_F(T_Download, BackoffDefersInsteadOfSleepingWhenThreaded) {
   const string url = "http://127.0.0.1:8122/object";
   cvmfs::MemSink sink;
   download_mgr.SetRetryParameters(2, 1000, 1000);
+  // Prng::Next() returns [0, boundary), so the first draw of
+  // prng_.Next(backoff_init_ms + 1) can legitimately be 0 and the
+  // single-threaded call would then not sleep at all.  Seed it so the draw is
+  // fixed (seed 1 yields 423 ms) and the assertions below are deterministic.
+  download_mgr.prng_.InitSeed(1);
 
   JobInfo single(&url, false, false, NULL, &sink);
   single.SetErrorCode(kFailHostTooSlow);
@@ -1324,7 +1347,7 @@ TEST_F(T_Download, BackoffDefersInsteadOfSleepingWhenThreaded) {
   const uint64_t slept_ms = (platform_monotonic_time_ns() / 1000000) - t0;
   EXPECT_EQ(0U, single.retry_not_before_ms())
       << "a single-threaded backoff should not defer";
-  EXPECT_GT(single.backoff_ms(), 0U);
+  EXPECT_EQ(423U, single.backoff_ms());
   // It really did wait, give or take the clock granularity.
   EXPECT_GE(slept_ms + 20, static_cast<uint64_t>(single.backoff_ms()));
 
