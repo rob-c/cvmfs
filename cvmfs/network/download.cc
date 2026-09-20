@@ -2445,7 +2445,8 @@ Failures DownloadManager::FetchParallel(JobInfo *info) {
   *(head.GetPidPtr()) = info->pid();
   *(head.GetUidPtr()) = info->uid();
   *(head.GetGidPtr()) = info->gid();
-  if ((Fetch(&head) != kFailOk) || (head.content_length() < kParallelFetchMinBytes))
+  if ((Fetch(&head) != kFailOk)
+      || (head.content_length() < kParallelFetchMinBytes))
     return kFailUnsupportedProtocol;
   const int64_t total = head.content_length();
   num_conns = std::min(static_cast<int64_t>(num_conns),
@@ -2490,7 +2491,8 @@ Failures DownloadManager::FetchParallel(JobInfo *info) {
       // is not fatal: the plain single-stream download resumes on its own
       result = kFailUnsupportedProtocol;
     } else if ((jobs[i]->http_code() != 206)
-               || (static_cast<int64_t>(sinks[i]->pos()) != jobs[i]->range_size())) {
+               || (static_cast<int64_t>(sinks[i]->pos())
+                   != jobs[i]->range_size())) {
       // Range not honoured (200 with the full body) or short: not usable
       result = kFailUnsupportedProtocol;
     }

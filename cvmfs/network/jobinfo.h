@@ -113,7 +113,8 @@ class JobInfo {
   unsigned backoff_ms_;
   /** Monotonic time (ms) before which a retry must not be re-issued */
   uint64_t retry_not_before_ms_;
-  /** Monotonic time (ms) of the first failed attempt without progress, 0: none */
+  /** Monotonic time (ms) of the first failed attempt without progress,
+   *  0: none */
   uint64_t no_progress_since_ms_;
   /** Large single objects may be fetched as parallel ranges (catalogs) */
   bool parallel_ok_;

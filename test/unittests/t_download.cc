@@ -774,13 +774,15 @@ TEST_F(T_Download, WatchFdsShrinkBackToFloor) {
 
   const unsigned n = download_mgr.watch_fds_max_ * 2 + 1;
   for (unsigned i = 0; i < n; ++i) {
-    DownloadManager::CallbackCurlSocket(NULL, static_cast<curl_socket_t>(100 + i),
+    DownloadManager::CallbackCurlSocket(NULL,
+                                        static_cast<curl_socket_t>(100 + i),
                                         CURL_POLL_IN, &download_mgr, NULL);
   }
   EXPECT_GT(download_mgr.watch_fds_size_, download_mgr.watch_fds_max_);
 
   for (unsigned i = 0; i < n; ++i) {
-    DownloadManager::CallbackCurlSocket(NULL, static_cast<curl_socket_t>(100 + i),
+    DownloadManager::CallbackCurlSocket(NULL,
+                                        static_cast<curl_socket_t>(100 + i),
                                         CURL_POLL_REMOVE, &download_mgr, NULL);
   }
   EXPECT_EQ(2U, download_mgr.watch_fds_inuse_);
