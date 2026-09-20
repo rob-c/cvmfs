@@ -954,6 +954,168 @@ HTTPResponse ResumeHandler(const HTTPRequest &req, void *data) {
 }  // namespace
 
 
+namespace {
+// A server that reports the object size for a HEAD and then serves byte
+// ranges, so the parallel-fetch path can be driven end to end.  The mock
+// server runs a single event loop, so these counters need no locking.
+struct RangeState {
+  RangeState()
+      : honour_range(true), heads(0), ranges(0), full_bodies(0) { }
+  bool honour_range;   ///< false: answer a Range request with a plain 200
+  int heads;
+  int ranges;          ///< requests answered with 206
+  int full_bodies;     ///< requests answered with the whole object
+  std::string content;
+};
+
+HTTPResponse RangeHandler(const HTTPRequest &req, void *data) {
+  RangeState *st = static_cast<RangeState *>(data);
+  HTTPResponse response;
+
+  if (req.method == "HEAD") {
+    st->heads++;
+    response.raw = true;
+    response.body = "HTTP/1.1 200 OK\r\nContent-Length: "
+                    + StringifyUint(st->content.length()) + "\r\n\r\n";
+    return response;
+  }
+
+  uint64_t from = 0;
+  uint64_t to = 0;
+  bool has_range = false;
+  for (HTTPHeaderList::const_iterator i = req.headers.begin();
+       i != req.headers.end(); ++i) {
+    if (i->first == "Range") {
+      has_range = true;
+      sscanf(i->second.c_str(), "bytes=%lu-%lu", &from, &to);  // NOLINT
+    }
+  }
+
+  if (has_range && st->honour_range) {
+    st->ranges++;
+    const size_t length = static_cast<size_t>(to - from + 1);
+    response.raw = true;
+    response.body = "HTTP/1.1 206 Partial Content\r\nContent-Length: "
+                    + StringifyUint(length) + "\r\n\r\n"
+                    + st->content.substr(static_cast<size_t>(from), length);
+    return response;
+  }
+
+  // No Range asked for, or this server refuses to honour one.
+  st->full_bodies++;
+  response.code = 200;
+  response.body = st->content;
+  return response;
+}
+
+// Content whose bytes vary, so that ranges stitched together in the wrong
+// order or at the wrong offset do not still hash to the expected value.
+std::string VaryingContent(size_t length) {
+  std::string content;
+  content.reserve(length);
+  for (size_t i = 0; i < length; ++i)
+    content.push_back(static_cast<char>(i % 251));
+  return content;
+}
+}  // namespace
+
+
+TEST_F(T_Download, ParallelFetchAssemblesRangesInOrder) {
+  // FetchParallel() splits a large object into concurrent range requests and
+  // stitches them back together.  Nothing exercised the method itself.
+  RangeState st;
+  st.content = VaryingContent(3 * 1024 * 1024);  // > kParallelFetchMinBytes
+  shash::Any content_hash(shash::kSha1);
+  shash::HashString(st.content, &content_hash);
+
+  MockHTTPServer server(8123);
+  ASSERT_TRUE(server.SetResponseCallback(RangeHandler, &st));
+  ASSERT_TRUE(server.Start());
+  download_mgr.SetProxyChain("DIRECT", "", DownloadManager::kSetProxyBoth);
+  download_mgr.SetParallelFetch(2);
+  download_mgr.Spawn();  // the parallel path requires a multi-threaded manager
+
+  // Ranges are written to a sink that does not pre-reserve; see
+  // Sink::RequiresReserve().
+  string dest_path;
+  FILE *fdest = CreateTemporaryFile(&dest_path);
+  ASSERT_TRUE(fdest != NULL);
+  cvmfs::FileSink filesink(fdest);
+
+  const string url = "http://127.0.0.1:8123/object";
+  JobInfo info(&url, false /* compressed */, false /* probe hosts */,
+               &content_hash, &filesink);
+  info.SetParallelOk(true);
+  download_mgr.Fetch(&info);
+
+  EXPECT_EQ(kFailOk, info.error_code());
+  EXPECT_EQ(1, st.heads) << "the size must be discovered with one HEAD";
+  EXPECT_EQ(2, st.ranges) << "two connections were configured";
+  EXPECT_EQ(0, st.full_bodies) << "the whole object was fetched in ranges";
+  fclose(fdest);
+
+  const int fd_read = open(dest_path.c_str(), O_RDONLY);
+  ASSERT_GE(fd_read, 0);
+  string written;
+  EXPECT_TRUE(SafeReadToString(fd_read, &written));
+  close(fd_read);
+  // Byte-for-byte: the hash check inside FetchParallel would already have
+  // caught a mis-assembly, but this also proves the right bytes reached the
+  // caller's sink.
+  EXPECT_EQ(st.content, written);
+  unlink(dest_path.c_str());
+  server.Stop();
+}
+
+
+TEST_F(T_Download, ParallelFetchFallsBackWhenRangeIgnored) {
+  // A server that answers a Range request with a plain 200 cannot be used for
+  // a parallel fetch.  The attempt must be abandoned and the ordinary
+  // single-stream download must still deliver the object intact.
+  RangeState st;
+  st.content = VaryingContent(3 * 1024 * 1024);
+  st.honour_range = false;
+  shash::Any content_hash(shash::kSha1);
+  shash::HashString(st.content, &content_hash);
+
+  MockHTTPServer server(8124);
+  ASSERT_TRUE(server.SetResponseCallback(RangeHandler, &st));
+  ASSERT_TRUE(server.Start());
+  download_mgr.SetProxyChain("DIRECT", "", DownloadManager::kSetProxyBoth);
+  download_mgr.SetParallelFetch(2);
+  download_mgr.Spawn();
+
+  string dest_path;
+  FILE *fdest = CreateTemporaryFile(&dest_path);
+  ASSERT_TRUE(fdest != NULL);
+  cvmfs::FileSink filesink(fdest);
+
+  const string url = "http://127.0.0.1:8124/object";
+  JobInfo info(&url, false /* compressed */, false /* probe hosts */,
+               &content_hash, &filesink);
+  info.SetParallelOk(true);
+  download_mgr.Fetch(&info);
+
+  EXPECT_EQ(kFailOk, info.error_code()) << "the fallback must still succeed";
+  EXPECT_EQ(1, st.heads);
+  EXPECT_EQ(0, st.ranges) << "this server never answers 206";
+  // Two ranges were attempted and answered with the full body, then the
+  // single-stream fetch asked for the object once more.
+  EXPECT_GE(st.full_bodies, 3);
+  fclose(fdest);
+
+  const int fd_read = open(dest_path.c_str(), O_RDONLY);
+  ASSERT_GE(fd_read, 0);
+  string written;
+  EXPECT_TRUE(SafeReadToString(fd_read, &written));
+  close(fd_read);
+  EXPECT_EQ(st.content, written)
+      << "the discarded range data must not have been left in the sink";
+  unlink(dest_path.c_str());
+  server.Stop();
+}
+
+
 TEST_F(T_Download, ResumeShortTransferWithRange) {
   // The branch resumes a transfer that was cut after delivering data, instead
   // of starting it again from byte zero.  Nothing covered this.
