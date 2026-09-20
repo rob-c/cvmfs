@@ -1779,6 +1779,13 @@ bool DownloadManager::VerifyAndFinalize(const int curl_error, JobInfo *info) {
            info->proxy().c_str(), curl_error);
   UpdateStatistics(info->curl_handle());
 
+  // Classify this attempt on its own evidence.  A retry reuses the same
+  // JobInfo and the same curl handle -- InitializeRequest() runs only when the
+  // job first arrives from the pipe -- so a peer_unresponsive_ left true by an
+  // earlier attempt would otherwise let SwitchProxy() escalate on evidence
+  // that no longer applies.  The branches below set it from this result.
+  info->SetPeerUnresponsive(false);
+
   bool was_metalink;
   std::string typ;
   if (info->current_metalink_chain_index() >= 0) {
@@ -1880,12 +1887,24 @@ bool DownloadManager::VerifyAndFinalize(const int curl_error, JobInfo *info) {
                                                      : kFailProxyShortTransfer);
       break;
     case CURLE_FILE_COULDNT_READ_FILE:
-    case CURLE_COULDNT_CONNECT:
+    case CURLE_COULDNT_CONNECT: {
       // A refused connection comes back in about a round trip and proves that
       // something is listening and actively rejecting -- a proxy out of slots,
       // not a dead one.  It is the opposite of unresponsive, so retry it here
       // rather than treating it as grounds to leave the local proxy.
-      info->SetPeerUnresponsive(false);
+      //
+      // CURLE_COULDNT_CONNECT is not only a refusal, though: it also covers
+      // ENETUNREACH, EHOSTUNREACH and similar, where nothing was reached at
+      // all.  Those are exactly the case escalation exists for, so ask the OS
+      // error which of the two happened rather than assuming the peer is up.
+      if (curl_error == CURLE_COULDNT_CONNECT) {
+        long os_errno = 0;  // NOLINT(runtime/int) -- libcurl's getinfo type
+        if (curl_easy_getinfo(info->curl_handle(), CURLINFO_OS_ERRNO,
+                              &os_errno)
+            == CURLE_OK) {
+          info->SetPeerUnresponsive(os_errno != ECONNREFUSED);
+        }
+      }
       if (info->proxy() != "DIRECT") {
         // This is a guess.  Fail-over can still change to switching host
         info->SetErrorCode(kFailProxyConnection);
@@ -1893,6 +1912,7 @@ bool DownloadManager::VerifyAndFinalize(const int curl_error, JobInfo *info) {
         info->SetErrorCode(kFailHostConnection);
       }
       break;
+    }
     case CURLE_TOO_MANY_REDIRECTS:
       info->SetErrorCode(kFailHostConnection);
       break;
