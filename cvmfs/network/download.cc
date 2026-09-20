@@ -678,7 +678,20 @@ void *DownloadManager::MainDownload(void *data) {
       continue;
     }
 
-    // Re-issue retries whose backoff has expired
+    // Handle timeout
+    if (retval == 0) {
+      curl_multi_socket_action(download_mgr->curl_multi_, CURL_SOCKET_TIMEOUT,
+                               0, &still_running);
+    }
+
+    // Terminate I/O thread
+    if (download_mgr->watch_fds_[kIdxPipeTerminate].revents)
+      break;
+
+    // Re-issue retries whose backoff has expired.  This has to stay below
+    // the termination check: a job taken out of `deferred` and handed to
+    // curl_multi_ is no longer covered by the shutdown cleanup after this
+    // loop, so its caller would wait for a result that never comes.
     if (!deferred.empty()) {
       const uint64_t now_ms = platform_monotonic_time_ns() / 1000000;
       for (unsigned i = 0; i < deferred.size();) {
@@ -695,16 +708,6 @@ void *DownloadManager::MainDownload(void *data) {
         }
       }
     }
-
-    // Handle timeout
-    if (retval == 0) {
-      curl_multi_socket_action(download_mgr->curl_multi_, CURL_SOCKET_TIMEOUT,
-                               0, &still_running);
-    }
-
-    // Terminate I/O thread
-    if (download_mgr->watch_fds_[kIdxPipeTerminate].revents)
-      break;
 
     // New job arrives
     if (download_mgr->watch_fds_[kIdxPipeJobs].revents) {
@@ -2478,6 +2481,8 @@ Failures DownloadManager::FetchParallel(JobInfo *info) {
   *(head.GetPidPtr()) = info->pid();
   *(head.GetUidPtr()) = info->uid();
   *(head.GetGidPtr()) = info->gid();
+  head.SetPathInfo(info->path_info());
+  head.SetInterruptCue(info->interrupt_cue());
   if ((Fetch(&head) != kFailOk)
       || (head.content_length() < kParallelFetchMinBytes))
     return kFailUnsupportedProtocol;
@@ -3012,6 +3017,13 @@ void DownloadManager::SwitchProxy(JobInfo *info) {
 
   // Fail any matching proxies within the current load-balancing group
   vector<ProxyInfo> *group = current_proxy_group();
+  // An empty group would make the group_size - burned subtraction below
+  // underflow and index off the end of the vector.  A chain can be left in
+  // that state by a DNS refresh, see UpdateProxiesUnlocked().
+  if ((group == NULL) || group->empty()
+      || (opt_proxy_groups_current_burned_ > group->size())) {
+    return;
+  }
   const unsigned group_size = group->size();
   unsigned failed = 0;
   for (unsigned i = 0; i < group_size - opt_proxy_groups_current_burned_; ++i) {
@@ -3836,6 +3848,12 @@ void DownloadManager::UpdateProxiesUnlocked(const string &reason) {
   // clean "no proxy available".
   if ((group == NULL) || group->empty()
       || (opt_proxy_groups_current_burned_ >= group->size())) {
+    // The map holds ProxyInfo pointers into the group, so leaving the previous
+    // selection in place here would hand ChooseProxyUnlocked() pointers into
+    // entries that have just been erased.  Nothing is selectable, and that is
+    // what the selection must say.
+    opt_proxy_map_.clear();
+    opt_proxies_.clear();
     return;
   }
   const unsigned num_alive = (group->size() - opt_proxy_groups_current_burned_);
