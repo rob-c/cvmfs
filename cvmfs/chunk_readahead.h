@@ -90,7 +90,7 @@ class ChunkReadahead : SingleCopy {
         item.label.flags |= CacheManager::kLabelVolatile;
       queue_.push_back(item);
       pending_.insert(item.hash);
-      num_queued++;
+      ++num_queued;
     }
     // One signal wakes one worker.  It then drains the whole batch by itself,
     // because on the next pass round its loop the queue is still not empty and

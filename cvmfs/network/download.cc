@@ -481,7 +481,8 @@ int DownloadManager::ParseHttpCode(const char digits[3]) {
  * libcurl tells us when it next needs curl_multi_socket_action(); MainDownload
  * uses this as its poll timeout instead of waking up every millisecond.
  */
-int DownloadManager::CallbackCurlTimer(CURLM * /* multi */, long timeout_ms,
+int DownloadManager::CallbackCurlTimer(CURLM * /* multi */,
+                                       long timeout_ms,  // NOLINT(runtime/int)
                                        void *userp) {
   DownloadManager *download_mgr = static_cast<DownloadManager *>(userp);
   download_mgr->curl_timeout_ms_ = timeout_ms;

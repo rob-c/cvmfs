@@ -293,7 +293,10 @@ class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
   dns::IpPreference opt_ip_preference() const { return opt_ip_preference_; }
 
  private:
-  static int CallbackCurlTimer(CURLM *multi, long timeout_ms, void *userp);
+  // libcurl's CURLMOPT_TIMERFUNCTION dictates the long parameter
+  static int CallbackCurlTimer(CURLM *multi,
+                               long timeout_ms,  // NOLINT(runtime/int)
+                               void *userp);
   static int CallbackCurlSocket(CURL *easy, curl_socket_t s, int action,
                                 void *userp, void *socketp);
   static void *MainDownload(void *data);
