@@ -159,6 +159,12 @@ static size_t CallbackCurlHeader(void *ptr, size_t size, size_t nmemb,
       info->SetHttpCode(DownloadManager::ParseHttpCode(&header_line[i]));
     }
 
+    if ((info->http_code() / 100) == 1) {
+      // 100 Continue, 103 Early Hints: informational, the real status line
+      // follows.  Treating it as an error aborted a perfectly good transfer.
+      return num_bytes;
+    }
+
     if ((info->http_code() / 100) == 2) {
       return num_bytes;
     } else if ((info->http_code() == 301) || (info->http_code() == 302)

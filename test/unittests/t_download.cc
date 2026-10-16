@@ -543,6 +543,44 @@ TEST_F(T_Download, ParseHttpCode) {
   EXPECT_EQ(999, DownloadManager::ParseHttpCode(digits));
 }
 
+namespace {
+// Sends an informational 103 Early Hints response ahead of the real one, as
+// some HTTP servers and proxies do.
+HTTPResponse EarlyHintsHandler(const HTTPRequest & /* req */, void *data) {
+  int *hits = static_cast<int *>(data);
+  (*hits)++;
+  HTTPResponse response;
+  response.raw = true;
+  response.body = "HTTP/1.1 103 Early Hints\r\nLink: </style.css>\r\n\r\n"
+                  "HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\npayload";
+  return response;
+}
+}  // namespace
+
+
+TEST_F(T_Download, InterimStatusIsNotAnError) {
+  // A 1xx status is informational and is followed by the real status line.
+  // It used to be classified as an HTTP error, so the transfer was aborted
+  // and the request failed although the server answered 200.
+  int hits = 0;
+  MockHTTPServer server(8132);
+  ASSERT_TRUE(server.SetResponseCallback(EarlyHintsHandler, &hits));
+  ASSERT_TRUE(server.Start());
+  download_mgr.SetProxyChain("DIRECT", "", DownloadManager::kSetProxyBoth);
+
+  const string url = "http://127.0.0.1:8132/object";
+  cvmfs::MemSink sink;
+  JobInfo info(&url, false, false, NULL, &sink);
+  download_mgr.Fetch(&info);
+
+  EXPECT_EQ(kFailOk, info.error_code());
+  EXPECT_EQ(200, info.http_code());
+  EXPECT_EQ("payload", string(reinterpret_cast<const char *>(sink.data()),
+                              sink.pos()));
+  server.Stop();
+}
+
+
 TEST_F(T_Download, EscapeUrl) {
   const std::string url = "http://ab0341.¡ÿϦ랝";  // c2a1 c3bf cfa6 eb9e9d
   const std::string correct = "http://ab0341.%C2%A1%C3%BF%CF%A6%EB%9E%9D";
