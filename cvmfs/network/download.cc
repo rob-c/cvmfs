@@ -850,6 +850,14 @@ CURL *DownloadManager::AcquireCurlHandle() {
     assert(handle != NULL);
 
     curl_easy_setopt(handle, CURLOPT_NOSIGNAL, 1);
+#if LIBCURL_VERSION_NUM >= 0x074100  // 7.65.0
+    // Do not reuse a pooled connection that has been idle for more than 30 s.
+    // libcurl's default of ~2 minutes outlives the idle timeout of a typical
+    // NAT, conntrack or DPI middlebox; once that has forgotten the flow, the
+    // connection is dead but looks open, and a request sent on it waits out a
+    // whole timeout before failing over away from a healthy proxy or host.
+    curl_easy_setopt(handle, CURLOPT_MAXAGE_CONN, 30L);
+#endif
     // curl_easy_setopt(curl_default, CURLOPT_FAILONERROR, 1);
     curl_easy_setopt(handle, CURLOPT_HEADERFUNCTION, CallbackCurlHeader);
     curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, CallbackCurlData);
