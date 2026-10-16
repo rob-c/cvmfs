@@ -133,6 +133,35 @@ static Failures PrepareDownloadDestination(JobInfo *info) {
 
 
 /**
+ * True when the TCP connect for this transfer completed, whatever happened
+ * afterwards.  It tells a peer that never answered apart from one that
+ * answered and then misbehaved.
+ *
+ * CURLINFO_CONNECT_TIME_T arrived in libcurl 7.61.0 but the build accepts
+ * 7.55.0 (see externals/libcurl/CMakeLists.txt), so fall back to the
+ * double-valued CURLINFO_CONNECT_TIME, which carries the same meaning at
+ * lower resolution.
+ */
+static bool ConnectCompleted(CURL *handle) {
+#if LIBCURL_VERSION_NUM >= 0x073d00  // 7.61.0
+  curl_off_t connect_time = 0;
+  if (curl_easy_getinfo(handle, CURLINFO_CONNECT_TIME_T, &connect_time)
+      != CURLE_OK) {
+    return false;
+  }
+  return connect_time > 0;
+#else
+  double connect_time = 0.0;
+  if (curl_easy_getinfo(handle, CURLINFO_CONNECT_TIME, &connect_time)
+      != CURLE_OK) {
+    return false;
+  }
+  return connect_time > 0.0;
+#endif
+}
+
+
+/**
  * Called by curl for every HTTP header. Not called for file:// transfers.
  */
 static size_t CallbackCurlHeader(void *ptr, size_t size, size_t nmemb,
@@ -1506,7 +1535,17 @@ bool DownloadManager::VerifyAndFinalize(const int curl_error, JobInfo *info) {
       info->SetErrorCode(kFailOk);
       break;
     case CURLE_UNSUPPORTED_PROTOCOL:
-      info->SetErrorCode(kFailUnsupportedProtocol);
+      // Also returned for a non-HTTP reply on an established connection
+      // (e.g. a middlebox injecting a plain-text block page), which libcurl
+      // rejects as HTTP/0.9.  That is a mangled transfer, not a bad URL, so
+      // let the usual retry and proxy/host fail-over apply instead of EIO.
+      if (ConnectCompleted(info->curl_handle())) {
+        info->SetErrorCode((info->proxy() == "DIRECT")
+                               ? kFailHostShortTransfer
+                               : kFailProxyShortTransfer);
+      } else {
+        info->SetErrorCode(kFailUnsupportedProtocol);
+      }
       break;
     case CURLE_URL_MALFORMAT:
       info->SetErrorCode(kFailBadUrl);

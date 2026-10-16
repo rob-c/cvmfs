@@ -125,6 +125,50 @@ TEST_F(T_Download, LocalFile) {
   fclose(fdest);
 }
 
+namespace {
+// The first reply is not HTTP at all -- the kind of plain-text block page a
+// middlebox injects -- and the second is a proper response.
+HTTPResponse BlockPageThenRealHandler(const HTTPRequest & /* req */,
+                                      void *data) {
+  int *hits = static_cast<int *>(data);
+  (*hits)++;
+  HTTPResponse response;
+  response.raw = true;
+  if (*hits == 1) {
+    response.body = "ACCESS DENIED BY POLICY\r\n";
+  } else {
+    response.body = "HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\npayload";
+  }
+  return response;
+}
+}  // namespace
+
+
+TEST_F(T_Download, MiddleboxReplyIsRetried) {
+  // libcurl rejects a reply that is not HTTP as HTTP/0.9 and reports it as
+  // CURLE_UNSUPPORTED_PROTOCOL, the same code as a malformed URL.  When the
+  // connection did come up, it is a mangled transfer and worth a retry, not a
+  // permanent error.
+  int hits = 0;
+  MockHTTPServer server(8134);
+  ASSERT_TRUE(server.SetResponseCallback(BlockPageThenRealHandler, &hits));
+  ASSERT_TRUE(server.Start());
+  download_mgr.SetProxyChain("DIRECT", "", DownloadManager::kSetProxyBoth);
+  download_mgr.SetRetryParameters(1, 0, 0);
+
+  const string url = "http://127.0.0.1:8134/object";
+  cvmfs::MemSink sink;
+  JobInfo info(&url, false, false, NULL, &sink);
+  download_mgr.Fetch(&info);
+
+  EXPECT_EQ(kFailOk, info.error_code());
+  EXPECT_EQ(2, hits) << "the mangled reply was not retried";
+  EXPECT_EQ("payload", string(reinterpret_cast<const char *>(sink.data()),
+                              sink.pos()));
+  server.Stop();
+}
+
+
 TEST_F(T_Download, RemoteFile) {
   string dest_path;
   FILE *fdest = CreateTemporaryFile(&dest_path);
