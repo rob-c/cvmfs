@@ -117,6 +117,7 @@ class CredentialsAttachment {
  */
 class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
   FRIEND_TEST(T_Download, ValidateGeoReply);
+  FRIEND_TEST(T_Download, EscalatedProxyGroupClassification);
   FRIEND_TEST(T_Download, StripDirect);
   FRIEND_TEST(T_Download, EscapeUrl);
 
@@ -272,6 +273,7 @@ class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
   void SwitchMetalink(JobInfo *info);
   void SwitchHost(JobInfo *info);
   void SwitchProxy(JobInfo *info);
+  bool IsEscalatedProxyGroup(unsigned group_idx) const;
   ProxyInfo *ChooseProxyUnlocked(const shash::Any *hash);
   void UpdateProxiesUnlocked(const std::string &reason);
   void RebalanceProxiesUnlocked(const std::string &reason);
@@ -366,6 +368,13 @@ class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
    * Between 0 and (*opt_proxy_groups_)[opt_proxy_groups_current_].size().
    */
   unsigned opt_proxy_groups_current_burned_;
+  /**
+   * How many of the current group's burned proxies were still delivering
+   * body bytes when they were burned.  A group is only left for a fallback
+   * or DIRECT tier when this is zero: a proxy that answers, however slowly,
+   * is saturated rather than dead.  Reset together with the burn counter.
+   */
+  unsigned opt_proxy_groups_current_burned_alive_;
   /**
    * The index of the first fallback proxy group.  If there are none,
    *  it is set to the number of regular proxy groups.

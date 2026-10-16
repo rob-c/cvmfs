@@ -357,6 +357,279 @@ TEST_F(T_Download, RemoteFileSwitchHostsAfterRedirect) {
   EXPECT_STREQ(reinterpret_cast<char *>(memsink.data()), src_content.c_str());
 }
 
+namespace {
+// Stands in for a saturated proxy: it answers, so it is plainly reachable,
+// but the body is cut short.  That is a throughput symptom, reported as
+// kFailProxyShortTransfer, not evidence of a dead peer.
+HTTPResponse TruncatingProxyHandler(const HTTPRequest & /* req */, void *data) {
+  int *hits = static_cast<int *>(data);
+  if (hits)
+    (*hits)++;
+  HTTPResponse response;
+  response.raw = true;
+  response.body = "HTTP/1.1 200 OK\r\nContent-Length: 65536\r\n\r\nshort";
+  return response;
+}
+
+HTTPResponse CountingProxyHandler(const HTTPRequest & /* req */, void *data) {
+  int *hits = static_cast<int *>(data);
+  if (hits)
+    (*hits)++;
+  HTTPResponse response;
+  response.code = 200;
+  response.body = "served by the fallback proxy";
+  return response;
+}
+
+struct FixedBodyState {
+  FixedBodyState() : hits(0) { }
+  int hits;
+  std::string body;
+};
+
+// A proxy that serves one fixed body for whatever it is asked.
+HTTPResponse FixedBodyHandler(const HTTPRequest &, void *data) {
+  FixedBodyState *st = static_cast<FixedBodyState *>(data);
+  st->hits++;
+  HTTPResponse response;
+  response.code = 200;
+  response.body = st->body;
+  return response;
+}
+}  // namespace
+
+
+TEST_F(T_Download, EscalatedProxyGroupClassification) {
+  vector<vector<DownloadManager::ProxyInfo> > chain;
+  unsigned current_group = 0;
+  unsigned fallback_group = 0;
+
+  // "proxy;DIRECT": group 0 is local, group 1 is the DIRECT tier.
+  download_mgr.SetProxyChain("http://127.0.0.1:3128;DIRECT", "",
+                             DownloadManager::kSetProxyBoth);
+  download_mgr.GetProxyInfo(&chain, &current_group, &fallback_group);
+  ASSERT_EQ(2U, chain.size());
+  EXPECT_FALSE(download_mgr.IsEscalatedProxyGroup(0));
+  EXPECT_TRUE(download_mgr.IsEscalatedProxyGroup(1));   // DIRECT tier
+  EXPECT_FALSE(download_mgr.IsEscalatedProxyGroup(99));  // out of range
+
+  // A proxy plus a fallback: group 0 is local, group 1 is off-site.
+  download_mgr.SetProxyChain("http://127.0.0.1:3128", "http://127.0.0.2:3128",
+                             DownloadManager::kSetProxyBoth);
+  download_mgr.GetProxyInfo(&chain, &current_group, &fallback_group);
+  ASSERT_EQ(2U, chain.size());
+  EXPECT_FALSE(download_mgr.IsEscalatedProxyGroup(0));
+  EXPECT_TRUE(download_mgr.IsEscalatedProxyGroup(1));   // fallback proxy
+
+  // Two local groups and no DIRECT: moving between them is plain failover.
+  download_mgr.SetProxyChain("http://127.0.0.1:3128;http://127.0.0.3:3128", "",
+                             DownloadManager::kSetProxyBoth);
+  EXPECT_FALSE(download_mgr.IsEscalatedProxyGroup(0));
+  EXPECT_FALSE(download_mgr.IsEscalatedProxyGroup(1));
+}
+
+
+TEST_F(T_Download, SlowProxyDoesNotEscalateToDirect) {
+  // The regression for the leak measured under load: a proxy that is merely
+  // saturated must not promote the DIRECT tier, because that puts unproxied
+  // traffic on the wire and then lets host failover roam the server list.
+  string src_path = GetSmallFile();
+  MockFileServer origin(8110, sandbox_path_);
+  int proxy_hits = 0;
+  MockHTTPServer slow_proxy(8111);
+  ASSERT_TRUE(slow_proxy.SetResponseCallback(TruncatingProxyHandler,
+                                             &proxy_hits));
+  ASSERT_TRUE(slow_proxy.Start());
+
+  download_mgr.SetProxyChain("http://127.0.0.1:8111;DIRECT", "",
+                             DownloadManager::kSetProxyBoth);
+  download_mgr.SetRetryParameters(2, 0, 0);
+
+  const string url = "http://127.0.0.1:8110/" + GetFileName(src_path);
+  cvmfs::MemSink sink;
+  JobInfo info(&url, false /* compressed */, false /* probe hosts */, NULL,
+               &sink);
+  download_mgr.Fetch(&info);
+
+  EXPECT_NE(kFailOk, info.error_code());
+  EXPECT_GT(proxy_hits, 0) << "the proxy was never even tried";
+  // The decisive assertion: the origin was never contacted directly.
+  EXPECT_EQ(0, origin.num_processed_requests());
+  EXPECT_NE("DIRECT", info.proxy());
+  slow_proxy.Stop();
+}
+
+
+TEST_F(T_Download, SlowProxyDoesNotEscalateToFallback) {
+  // Same rule for the off-site fallback proxies: saturation at the local
+  // proxy is not a reason to ship the request to another site.
+  string src_path = GetSmallFile();
+  MockFileServer origin(8112, sandbox_path_);
+  int slow_hits = 0;
+  int fallback_hits = 0;
+  MockHTTPServer slow_proxy(8113);
+  ASSERT_TRUE(slow_proxy.SetResponseCallback(TruncatingProxyHandler,
+                                             &slow_hits));
+  ASSERT_TRUE(slow_proxy.Start());
+  MockHTTPServer fallback_proxy(8114);
+  ASSERT_TRUE(fallback_proxy.SetResponseCallback(CountingProxyHandler,
+                                                 &fallback_hits));
+  ASSERT_TRUE(fallback_proxy.Start());
+
+  download_mgr.SetProxyChain("http://127.0.0.1:8113",
+                             "http://127.0.0.1:8114",
+                             DownloadManager::kSetProxyBoth);
+  download_mgr.SetRetryParameters(2, 0, 0);
+
+  const string url = "http://127.0.0.1:8112/" + GetFileName(src_path);
+  cvmfs::MemSink sink;
+  JobInfo info(&url, false, false, NULL, &sink);
+  download_mgr.Fetch(&info);
+
+  EXPECT_NE(kFailOk, info.error_code());
+  EXPECT_GT(slow_hits, 0);
+  EXPECT_EQ(0, fallback_hits) << "a saturated local proxy escalated off-site";
+  EXPECT_EQ(0, origin.num_processed_requests());
+  slow_proxy.Stop();
+  fallback_proxy.Stop();
+}
+
+
+TEST_F(T_Download, MixedGroupStaysWhenAnyProxyAlive) {
+  // A load-balance group with one dead proxy and one saturated one is a
+  // group that still delivers data: it must not be left for DIRECT, and that
+  // must not depend on which of the two happened to be burned last.  Proxy
+  // selection is random, so run it several times.
+  string src_path = GetSmallFile();
+  MockFileServer origin(8110, sandbox_path_);
+  int proxy_hits = 0;
+  MockHTTPServer slow_proxy(8127);
+  ASSERT_TRUE(slow_proxy.SetResponseCallback(TruncatingProxyHandler,
+                                             &proxy_hits));
+  ASSERT_TRUE(slow_proxy.Start());
+
+  const string url = "http://127.0.0.1:8110/" + GetFileName(src_path);
+  for (unsigned round = 0; round < 6; ++round) {
+    download_mgr.SetProxyChain(
+        "http://127.0.0.1:8097|http://127.0.0.1:8127;DIRECT", "",
+        DownloadManager::kSetProxyBoth);
+    download_mgr.SetRetryParameters(1, 0, 0);
+    download_mgr.SetTimeout(2, 2);
+    cvmfs::MemSink sink;
+    JobInfo info(&url, false, false, NULL, &sink);
+    download_mgr.Fetch(&info);
+    EXPECT_NE(kFailOk, info.error_code()) << "round " << round;
+    EXPECT_NE("DIRECT", info.proxy()) << "round " << round;
+  }
+  EXPECT_GT(proxy_hits, 0);
+  EXPECT_EQ(0, origin.num_processed_requests())
+      << "the origin was contacted directly although a proxy was alive";
+  slow_proxy.Stop();
+}
+
+
+TEST_F(T_Download, RefusedProxyEscalatesToDirect) {
+  // A refused connect means nothing is listening: a stopped squid.  (An
+  // overloaded one leaves the SYN in its backlog or drops it, and times out
+  // instead.)  That is exactly what the DIRECT tier is for.  Nothing listens
+  // on 8097, so the kernel refuses at once; after the cheap retries the
+  // request must go DIRECT rather than being pinned to the dead proxy.
+  string src_path = GetSmallFile();
+  MockFileServer file_server(8098, sandbox_path_);
+
+  download_mgr.SetProxyChain("http://127.0.0.1:8097;DIRECT", "",
+                             DownloadManager::kSetProxyBoth);
+  download_mgr.SetRetryParameters(1, 0, 0);
+  download_mgr.SetTimeout(2, 2);
+
+  string src_url = "http://127.0.0.1:8098/" + GetFileName(src_path);
+  cvmfs::MemSink memsink;
+  JobInfo info(&src_url, false, false, NULL, &memsink);
+  download_mgr.Fetch(&info);
+
+  EXPECT_EQ(kFailOk, info.error_code());
+  EXPECT_EQ("DIRECT", info.proxy());
+  EXPECT_EQ(1, file_server.num_processed_requests());
+}
+
+
+TEST_F(T_Download, RefusedProxyReachesFallbackProxy) {
+  // The same for CVMFS_FALLBACK_PROXY: a dead local proxy must hand over to
+  // the off-site fallback, not fail the request while a healthy fallback is
+  // configured.
+  FixedBodyState st;
+  st.body = "served by the fallback proxy";
+  MockHTTPServer fallback(8125);
+  ASSERT_TRUE(fallback.SetResponseCallback(FixedBodyHandler, &st));
+  ASSERT_TRUE(fallback.Start());
+
+  download_mgr.SetProxyChain("http://127.0.0.1:8097", "http://127.0.0.1:8125",
+                             DownloadManager::kSetProxyBoth);
+  download_mgr.SetRetryParameters(1, 0, 0);
+  download_mgr.SetTimeout(2, 2);
+
+  const string url = "http://127.0.0.1:8126/object";
+  cvmfs::MemSink sink;
+  JobInfo info(&url, false, false, NULL, &sink);
+  download_mgr.Fetch(&info);
+
+  EXPECT_EQ(kFailOk, info.error_code());
+  EXPECT_EQ("http://127.0.0.1:8125", info.proxy());
+  EXPECT_EQ(1, st.hits);
+  EXPECT_EQ(st.body, string(reinterpret_cast<const char *>(sink.data()),
+                            sink.pos()));
+  fallback.Stop();
+}
+
+
+TEST_F(T_Download, UnresponsiveProxyEscalatesToDirect) {
+  // A proxy that never answers the connect is genuinely unreachable, which is
+  // what the DIRECT tier exists for.  192.0.2.0/24 is TEST-NET-1 from RFC
+  // 5737: it is not routed, so the connect runs out of time rather than being
+  // refused, and CURLINFO_CONNECT_TIME_T stays zero.
+  string src_path = GetSmallFile();
+  MockFileServer file_server(8096, sandbox_path_);
+
+  download_mgr.SetProxyChain("http://192.0.2.1:3128;DIRECT", "",
+                             DownloadManager::kSetProxyBoth);
+  download_mgr.SetRetryParameters(1, 0, 0);
+  download_mgr.SetTimeout(2, 2);
+
+  string src_url = "http://127.0.0.1:8096/" + GetFileName(src_path);
+  cvmfs::MemSink memsink;
+  JobInfo info(&src_url, false /* compressed */, false /* probe hosts */, NULL,
+               &memsink);
+  download_mgr.Fetch(&info);
+
+  EXPECT_EQ(kFailOk, info.error_code());
+  EXPECT_EQ("DIRECT", info.proxy());
+  EXPECT_EQ(1, file_server.num_processed_requests());
+}
+
+
+TEST_F(T_Download, UnresolvableProxyEscalatesToDirect) {
+  // A proxy whose name does not resolve is pointed at a sentinel address the
+  // kernel refuses at once.  That refusal must read as "the proxy is gone",
+  // not as "a proxy is listening", or the DIRECT tier is never reached.
+  string src_path = GetSmallFile();
+  MockFileServer file_server(8098, sandbox_path_);
+
+  download_mgr.SetProxyChain("http://proxy.does-not-exist.invalid:3128;DIRECT",
+                             "", DownloadManager::kSetProxyBoth);
+  download_mgr.SetRetryParameters(1, 0, 0);
+  download_mgr.SetTimeout(2, 2);
+
+  string src_url = "http://127.0.0.1:8098/" + GetFileName(src_path);
+  cvmfs::MemSink memsink;
+  JobInfo info(&src_url, false, false, NULL, &memsink);
+  download_mgr.Fetch(&info);
+
+  EXPECT_EQ(kFailOk, info.error_code());
+  EXPECT_EQ("DIRECT", info.proxy());
+  EXPECT_EQ(1, file_server.num_processed_requests());
+}
+
+
 TEST_F(T_Download, RemoteFileSwitchProxies) {
   string src_path = GetSmallFile();
   int src_fd = open(src_path.c_str(), O_RDONLY);

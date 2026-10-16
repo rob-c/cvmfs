@@ -1453,6 +1453,19 @@ bool DownloadManager::VerifyAndFinalize(const int curl_error, JobInfo *info) {
            name_.c_str(), info->id(), info->url()->c_str(),
            info->proxy().c_str(), curl_error);
   UpdateStatistics(info->curl_handle());
+  {
+    // Body bytes this attempt delivered.  For a non-2xx the header callback
+    // stops the transfer before any body byte, so this is zero exactly when
+    // the peer gave nothing usable; SwitchProxy() decides on that.
+    curl_off_t attempt_bytes = 0;
+    if (curl_easy_getinfo(info->curl_handle(), CURLINFO_SIZE_DOWNLOAD_T,
+                          &attempt_bytes)
+        != CURLE_OK) {
+      attempt_bytes = 0;
+    }
+    info->SetAttemptBytes((attempt_bytes > 0)
+                              ? static_cast<uint64_t>(attempt_bytes) : 0);
+  }
 
   bool was_metalink;
   std::string typ;
@@ -1914,6 +1927,7 @@ DownloadManager::DownloadManager(const unsigned max_pool_handles,
     , opt_proxy_groups_(NULL)
     , opt_proxy_groups_current_(0)
     , opt_proxy_groups_current_burned_(0)
+    , opt_proxy_groups_current_burned_alive_(0)
     , opt_proxy_groups_fallback_(0)
     , opt_num_proxies_(0)
     , opt_proxy_shard_(false)
@@ -2390,8 +2404,11 @@ void DownloadManager::SwitchProxy(JobInfo *info) {
   unsigned failed = 0;
   for (unsigned i = 0; i < group_size - opt_proxy_groups_current_burned_; ++i) {
     if (info && (info->proxy() == (*group)[i].url)) {
-      // Move to list of failed proxies
+      // Move to list of failed proxies, remembering whether it was still
+      // delivering data: that is what separates saturated from dead below.
       opt_proxy_groups_current_burned_++;
+      if (info->attempt_bytes() > 0)
+        opt_proxy_groups_current_burned_alive_++;
       swap((*group)[i],
            (*group)[group_size - opt_proxy_groups_current_burned_]);
       perf::Inc(counters_->n_proxy_failover);
@@ -2406,10 +2423,37 @@ void DownloadManager::SwitchProxy(JobInfo *info) {
   // If all proxies from the current load-balancing group are burned, switch to
   // another group
   if (opt_proxy_groups_current_burned_ == group->size()) {
+    const unsigned burned_alive = opt_proxy_groups_current_burned_alive_;
     opt_proxy_groups_current_burned_ = 0;
+    opt_proxy_groups_current_burned_alive_ = 0;
     if (opt_proxy_groups_->size() > 1) {
-      opt_proxy_groups_current_ = (opt_proxy_groups_current_ + 1)
+      const unsigned next_group = (opt_proxy_groups_current_ + 1)
                                   % opt_proxy_groups_->size();
+      // Leaving the local proxy set -- for an unproxied connection, or for an
+      // off-site fallback proxy -- needs evidence that the local proxies are
+      // actually gone, not merely slow.  The evidence is whether they were
+      // still delivering body bytes when they were burned: a saturated proxy
+      // answers, just slowly (a short transfer or a timeout with progress),
+      // and escalating on that is what silently moved traffic off-site under
+      // load.  Everything that delivers nothing counts as unreachable: a
+      // refused connect (no listener -- a stopped squid; an overloaded one
+      // drops SYNs and times out instead), a connect that hangs, a timeout
+      // after connecting with no body byte, an HTTP error, or a name that no
+      // longer resolves.  The decision covers the whole group, so it does not
+      // depend on which member happened to be burned last.
+      if (IsEscalatedProxyGroup(next_group)
+          && !IsEscalatedProxyGroup(opt_proxy_groups_current_)
+          && (burned_alive > 0)) {
+        LogCvmfs(kLogDownload, kLogDebug,
+                 "(manager '%s' - id %" PRId64 ") "
+                 "keeping proxy group %u: %u of its proxies still deliver "
+                 "data, so not falling back to group %u",
+                 name_.c_str(), info->id(), opt_proxy_groups_current_,
+                 burned_alive, next_group);
+        UpdateProxiesUnlocked("failed proxy, escalation withheld");
+        return;
+      }
+      opt_proxy_groups_current_ = next_group;
       // Remember the timestamp of switching to backup proxies
       if (opt_proxy_groups_reset_after_ > 0) {
         if (opt_proxy_groups_current_ > 0) {
@@ -2783,6 +2827,7 @@ bool DownloadManager::ProbeGeo() {
       opt_proxy_groups_current_ = opt_proxy_groups_->size() - 1;
     }
     opt_proxy_groups_current_burned_ = 0;
+    opt_proxy_groups_current_burned_alive_ = 0;
   }
 
   UpdateProxiesUnlocked("geosort");
@@ -2921,6 +2966,7 @@ void DownloadManager::SetProxyChain(const string &proxy_list,
     opt_proxy_groups_ = NULL;
     opt_proxy_groups_current_ = 0;
     opt_proxy_groups_current_burned_ = 0;
+    opt_proxy_groups_current_burned_alive_ = 0;
     opt_proxy_groups_fallback_ = 0;
     opt_num_proxies_ = 0;
     return;
@@ -3022,6 +3068,7 @@ void DownloadManager::SetProxyChain(const string &proxy_list,
            name_.c_str(), opt_num_proxies_, opt_proxy_groups_->size());
   opt_proxy_groups_current_ = 0;
   opt_proxy_groups_current_burned_ = 0;
+  opt_proxy_groups_current_burned_alive_ = 0;
 
   // Select random start proxy from the first group.
   if (opt_proxy_groups_->size() > 0) {
@@ -3065,6 +3112,24 @@ string DownloadManager::GetProxyList() { return opt_proxy_list_; }
 string DownloadManager::GetFallbackProxyList() {
   return opt_proxy_fallback_list_;
 }
+
+/**
+ * True when using this proxy group means the request has left the local proxy
+ * set: either it is a DIRECT tier, so the request goes out unproxied, or it is
+ * one of the fallback groups, which are by construction off-site.
+ *
+ * Moving between the regular groups is ordinary load-balancing failover and is
+ * not escalation.
+ */
+bool DownloadManager::IsEscalatedProxyGroup(unsigned group_idx) const {
+  if (!opt_proxy_groups_ || (group_idx >= opt_proxy_groups_->size()))
+    return false;
+  if (group_idx >= opt_proxy_groups_fallback_)
+    return true;
+  const std::vector<ProxyInfo> &group = (*opt_proxy_groups_)[group_idx];
+  return !group.empty() && (group[0].url == "DIRECT");
+}
+
 
 /**
  * Choose proxy
@@ -3165,6 +3230,7 @@ void DownloadManager::RebalanceProxiesUnlocked(const string &reason) {
 
   opt_timestamp_failover_proxies_ = 0;
   opt_proxy_groups_current_burned_ = 0;
+  opt_proxy_groups_current_burned_alive_ = 0;
   UpdateProxiesUnlocked(reason);
 }
 
@@ -3335,6 +3401,8 @@ DownloadManager *DownloadManager::Clone(
 void DownloadManager::CloneProxyConfig(DownloadManager *clone) {
   clone->opt_proxy_groups_current_ = opt_proxy_groups_current_;
   clone->opt_proxy_groups_current_burned_ = opt_proxy_groups_current_burned_;
+  clone->opt_proxy_groups_current_burned_alive_ =
+      opt_proxy_groups_current_burned_alive_;
   clone->opt_proxy_groups_fallback_ = opt_proxy_groups_fallback_;
   clone->opt_num_proxies_ = opt_num_proxies_;
   clone->opt_proxy_shard_ = opt_proxy_shard_;
