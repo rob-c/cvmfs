@@ -310,6 +310,7 @@ class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
   curl_slist *default_headers_;
   char *user_agent_;
 
+  FRIEND_TEST(T_Download, BackoffDefersInsteadOfSleepingWhenThreaded);
   pthread_t thread_download_;
   std::atomic<int32_t> multi_threaded_;
   std::unique_ptr<Pipe<kPipeThreadTerminator> > pipe_terminate_;

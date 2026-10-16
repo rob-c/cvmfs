@@ -82,6 +82,7 @@ void JobInfo::Init() {
   num_retries_ = 0;
   no_progress_since_ms_ = 0;
   backoff_ms_ = 0;
+  retry_not_before_ms_ = 0;
   current_metalink_chain_index_ = -1;
   current_host_chain_index_ = -1;
 

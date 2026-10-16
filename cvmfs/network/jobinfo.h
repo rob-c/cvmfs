@@ -110,6 +110,8 @@ class JobInfo {
    *  0: none */
   uint64_t no_progress_since_ms_;
   unsigned backoff_ms_;
+  /** Monotonic time (ms) before which a retry must not be re-issued */
+  uint64_t retry_not_before_ms_;
   int current_metalink_chain_index_;
   int current_host_chain_index_;
 
@@ -212,6 +214,7 @@ class JobInfo {
   unsigned char num_retries() const { return num_retries_; }
   uint64_t no_progress_since_ms() const { return no_progress_since_ms_; }
   unsigned backoff_ms() const { return backoff_ms_; }
+  uint64_t retry_not_before_ms() const { return retry_not_before_ms_; }
   int current_metalink_chain_index() const {
     return current_metalink_chain_index_;
   }
@@ -275,6 +278,7 @@ class JobInfo {
   void SetNumRetries(unsigned char num_retries) { num_retries_ = num_retries; }
   void SetNoProgressSinceMs(uint64_t t) { no_progress_since_ms_ = t; }
   void SetBackoffMs(unsigned backoff_ms) { backoff_ms_ = backoff_ms; }
+  void SetRetryNotBeforeMs(uint64_t t) { retry_not_before_ms_ = t; }
   void SetCurrentMetalinkChainIndex(int current_metalink_chain_index) {
     current_metalink_chain_index_ = current_metalink_chain_index;
   }
