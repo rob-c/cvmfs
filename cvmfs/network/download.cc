@@ -451,6 +451,19 @@ int DownloadManager::ParseHttpCode(const char digits[3]) {
 
 
 /**
+ * libcurl tells us when it next needs curl_multi_socket_action(); MainDownload
+ * uses this as its poll timeout instead of waking up every millisecond.
+ */
+int DownloadManager::CallbackCurlTimer(CURLM * /* multi */,
+                                       long timeout_ms,  // NOLINT(runtime/int)
+                                       void *userp) {
+  DownloadManager *download_mgr = static_cast<DownloadManager *>(userp);
+  download_mgr->curl_timeout_ms_ = timeout_ms;
+  return 0;
+}
+
+
+/**
  * Called when new curl sockets arrive or existing curl sockets depart.
  */
 int DownloadManager::CallbackCurlSocket(CURL * /* easy */,
@@ -569,7 +582,12 @@ void *DownloadManager::MainDownload(void *data) {
       // timeout.  TODO(bbockelm) we should switch to that in the future.
       timeout = 100;
       */
-      timeout = 1;
+      // Wake up when libcurl asked for it (timer callback), at most every
+      // 100 ms as a safety net, instead of spinning with a 1 ms timeout.
+      const long curl_timeout = download_mgr->curl_timeout_ms_;  // NOLINT
+      timeout = ((curl_timeout >= 0) && (curl_timeout < 100))
+                    ? static_cast<int>(curl_timeout)
+                    : 100;
     } else {
       timeout = -1;
       gettimeofday(&timeval_stop, NULL);
@@ -1896,6 +1914,7 @@ DownloadManager::DownloadManager(const unsigned max_pool_handles,
     , watch_fds_size_(0)
     , watch_fds_inuse_(0)
     , watch_fds_max_(4 * max_pool_handles)
+    , curl_timeout_ms_(-1)
     , opt_timeout_proxy_(5)
     , opt_timeout_direct_(10)
     , opt_low_speed_limit_(1024)
@@ -1944,6 +1963,8 @@ DownloadManager::DownloadManager(const unsigned max_pool_handles,
   curl_multi_ = curl_multi_init();
   assert(curl_multi_ != NULL);
   curl_multi_setopt(curl_multi_, CURLMOPT_SOCKETFUNCTION, CallbackCurlSocket);
+  curl_multi_setopt(curl_multi_, CURLMOPT_TIMERFUNCTION, CallbackCurlTimer);
+  curl_multi_setopt(curl_multi_, CURLMOPT_TIMERDATA, static_cast<void *>(this));
   curl_multi_setopt(curl_multi_, CURLMOPT_SOCKETDATA,
                     static_cast<void *>(this));
   curl_multi_setopt(curl_multi_, CURLMOPT_MAXCONNECTS, watch_fds_max_);

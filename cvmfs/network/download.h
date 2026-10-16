@@ -262,6 +262,10 @@ class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
  private:
   static int CallbackCurlSocket(CURL *easy, curl_socket_t s, int action,
                                 void *userp, void *socketp);
+  // libcurl's CURLMOPT_TIMERFUNCTION dictates the long parameter
+  static int CallbackCurlTimer(CURLM *multi,
+                               long timeout_ms,  // NOLINT(runtime/int)
+                               void *userp);
   static void *MainDownload(void *data);
 
   bool StripDirect(const std::string &proxy_list, std::string *cleaned_list);
@@ -319,6 +323,8 @@ class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
   uint32_t watch_fds_size_;
   uint32_t watch_fds_inuse_;
   uint32_t watch_fds_max_;
+  /** Next timeout requested by libcurl (CURLMOPT_TIMERFUNCTION), -1: none */
+  long curl_timeout_ms_;  // NOLINT(runtime/int)
 
   pthread_mutex_t *lock_options_;
   pthread_mutex_t *lock_synchronous_mode_;
