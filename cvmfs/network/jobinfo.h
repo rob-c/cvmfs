@@ -75,6 +75,8 @@ class JobInfo {
   bool head_request_;
   bool follow_redirects_;
   bool force_nocache_;
+  /** Large single objects may be fetched as parallel ranges (catalogs) */
+  bool parallel_ok_;
   pid_t pid_;
   uid_t uid_;
   gid_t gid_;
@@ -191,6 +193,7 @@ class JobInfo {
   bool head_request() const { return head_request_; }
   bool follow_redirects() const { return follow_redirects_; }
   bool force_nocache() const { return force_nocache_; }
+  bool parallel_ok() const { return parallel_ok_; }
   pid_t pid() const { return pid_; }
   uid_t uid() const { return uid_; }
   gid_t gid() const { return gid_; }
@@ -244,6 +247,7 @@ class JobInfo {
     follow_redirects_ = follow_redirects;
   }
   void SetForceNocache(bool force_nocache) { force_nocache_ = force_nocache; }
+  void SetParallelOk(bool ok) { parallel_ok_ = ok; }
   void SetCredData(void *cred_data) { cred_data_ = cred_data; }
   void SetInterruptCue(InterruptCue *interrupt_cue) {
     interrupt_cue_ = interrupt_cue;

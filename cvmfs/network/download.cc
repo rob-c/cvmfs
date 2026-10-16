@@ -2152,6 +2152,7 @@ DownloadManager::DownloadManager(const unsigned max_pool_handles,
     , opt_max_retries_(0)
     , opt_backoff_init_ms_(0)
     , opt_backoff_max_ms_(0)
+    , opt_parallel_fetch_(0)
     , enable_info_header_(false)
     , opt_ipv4_only_(false)
     , follow_redirects_(false)
@@ -2236,6 +2237,188 @@ void DownloadManager::Spawn() {
 }
 
 
+namespace {
+
+/** Minimum compressed object size for a parallel multi-range fetch */
+const int64_t kParallelFetchMinBytes = 2 * 1024 * 1024;
+/** Target size of each range of a parallel fetch */
+const int64_t kParallelFetchRangeBytes = 1024 * 1024;
+
+struct SubFetch {
+  DownloadManager *mgr;
+  JobInfo *job;
+  Failures result;
+};
+
+void *MainSubFetch(void *data) {
+  SubFetch *sub = static_cast<SubFetch *>(data);
+  sub->result = sub->mgr->Fetch(sub->job);
+  return NULL;
+}
+
+}  // anonymous namespace
+
+
+/**
+ * Downloads a large object as several concurrent range requests (one TCP
+ * flow each) and assembles, verifies and decompresses it on the caller
+ * thread.  On a link where a single flow is slow (latency, loss, per-flow
+ * caps) this multiplies the throughput of catalogs and other big single
+ * objects, which unlike chunked files cannot profit from read-ahead.
+ *
+ * Returns kFailUnsupportedProtocol if the object is not eligible (too small,
+ * no ranges supported, ...) so that the caller falls back to a plain fetch.
+ */
+Failures DownloadManager::FetchParallel(JobInfo *info) {
+  unsigned num_conns;
+  {
+    const MutexLockGuard m(lock_options_);
+    num_conns = opt_parallel_fetch_;
+  }
+  if ((num_conns < 2) || !info->parallel_ok()
+      || (multi_threaded_.load() != 1)
+      || (info->expected_hash() == NULL) || (info->sink() == NULL)
+      || info->sink()->RequiresReserve() || info->head_request()
+      || (info->range_offset() != -1) || info->force_nocache()) {
+    return kFailUnsupportedProtocol;
+  }
+
+  // Size of the compressed object
+  JobInfo head(info->url(), info->probe_hosts());
+  *(head.GetPidPtr()) = info->pid();
+  *(head.GetUidPtr()) = info->uid();
+  *(head.GetGidPtr()) = info->gid();
+  head.SetPathInfo(info->path_info());
+  head.SetInterruptCue(info->interrupt_cue());
+  if ((Fetch(&head) != kFailOk)
+      || (head.content_length() < kParallelFetchMinBytes))
+    return kFailUnsupportedProtocol;
+  const int64_t total = head.content_length();
+  num_conns = std::min(static_cast<int64_t>(num_conns),
+                       (total + kParallelFetchRangeBytes - 1)
+                           / kParallelFetchRangeBytes);
+  const int64_t range = (total + num_conns - 1) / num_conns;
+  LogCvmfs(kLogDownload, kLogDebug,
+           "(manager '%s' - id %" PRId64 ") parallel fetch of %s: "
+           "%" PRId64 " bytes in %u ranges",
+           name_.c_str(), info->id(), info->url()->c_str(), total, num_conns);
+
+  // One raw (uncompressed, unhashed) range per connection
+  std::vector<cvmfs::MemSink *> sinks;
+  std::vector<JobInfo *> jobs;
+  std::vector<SubFetch> subs(num_conns);
+  std::vector<pthread_t> threads(num_conns);
+  for (unsigned i = 0; i < num_conns; ++i) {
+    const int64_t offset = static_cast<int64_t>(i) * range;
+    const int64_t size = std::min(range, total - offset);
+    // The cap matters twice: a retry Reset()s the sink and must be able to
+    // regrow to the range, and a 200 with the whole object must be refused
+    // at the header rather than swallowed.
+    cvmfs::MemSink *sink = new cvmfs::MemSink(static_cast<size_t>(size),
+                                              static_cast<size_t>(size));
+    JobInfo *job = new JobInfo(info->url(), false /* compressed */,
+                               info->probe_hosts(), NULL /* hash */, sink);
+    job->SetRangeOffset(offset);
+    job->SetRangeSize(size);
+    *(job->GetPidPtr()) = info->pid();
+    *(job->GetUidPtr()) = info->uid();
+    *(job->GetGidPtr()) = info->gid();
+    // Without these the CVMFS_INFO_HEADER shows "path=-" for every range and
+    // a cancellation is ignored until all range threads have finished.
+    job->SetPathInfo(info->path_info());
+    job->SetInterruptCue(info->interrupt_cue());
+    sinks.push_back(sink);
+    jobs.push_back(job);
+    subs[i].mgr = this;
+    subs[i].job = job;
+    subs[i].result = kFailOther;
+    const int retval = pthread_create(&threads[i], NULL, MainSubFetch,
+                                      &subs[i]);
+    assert(retval == 0);
+  }
+  Failures result = kFailOk;
+  for (unsigned i = 0; i < num_conns; ++i) {
+    pthread_join(threads[i], NULL);
+    if ((subs[i].result == kFailCanceled)
+        || (info->interrupt_cue() && info->interrupt_cue()->IsCanceled())) {
+      // A cancelled range is a cancelled object, not "not a candidate":
+      // falling through would download the whole thing single-stream anyway.
+      result = kFailCanceled;
+    } else if (result == kFailCanceled) {
+      // keep the verdict
+    } else if (subs[i].result != kFailOk) {
+      // A range that did not make it (after its own retries and fail-over)
+      // is not fatal: the plain single-stream download resumes on its own
+      result = kFailUnsupportedProtocol;
+    } else if ((jobs[i]->http_code() != 206)
+               || (static_cast<int64_t>(sinks[i]->pos())
+                   != jobs[i]->range_size())) {
+      // Range not honoured (200 with the full body) or short: not usable
+      result = kFailUnsupportedProtocol;
+    }
+  }
+
+  // Verify the content hash over the concatenated ranges
+  if (result == kFailOk) {
+    shash::ContextPtr ctx(info->expected_hash()->algorithm);
+    ctx.buffer = alloca(ctx.size);
+    shash::Init(ctx);
+    for (unsigned i = 0; i < num_conns; ++i)
+      shash::Update(sinks[i]->data(), sinks[i]->pos(), ctx);
+    shash::Any hash(info->expected_hash()->algorithm);
+    shash::Final(ctx, &hash);
+    if (hash != *(info->expected_hash())) {
+      LogCvmfs(kLogDownload, kLogDebug | kLogSyslogWarn,
+               "(manager '%s' - id %" PRId64 ") "
+               "parallel fetch of %s: hash mismatch, falling back",
+               name_.c_str(), info->id(), info->url()->c_str());
+      result = kFailUnsupportedProtocol;
+    }
+  }
+
+  // Decompress / copy into the caller's sink
+  if (result == kFailOk) {
+    if (info->compressed()) {
+      z_stream zstream;
+      zlib::DecompressInit(&zstream);
+      for (unsigned i = 0; (i < num_conns) && (result == kFailOk); ++i) {
+        const zlib::StreamStates retval = zlib::DecompressZStream2Sink(
+            sinks[i]->data(), static_cast<int64_t>(sinks[i]->pos()), &zstream,
+            info->sink());
+        if (retval == zlib::kStreamDataError)
+          result = kFailBadData;
+        else if (retval == zlib::kStreamIOError)
+          result = kFailLocalIO;
+      }
+      zlib::DecompressFini(&zstream);
+    } else {
+      for (unsigned i = 0; (i < num_conns) && (result == kFailOk); ++i) {
+        const int64_t written = info->sink()->Write(sinks[i]->data(),
+                                                    sinks[i]->pos());
+        if (written != static_cast<int64_t>(sinks[i]->pos()))
+          result = kFailLocalIO;
+      }
+    }
+    if ((result == kFailOk) && (info->sink()->Flush() != 0))
+      result = kFailLocalIO;
+    if (result != kFailOk)
+      info->sink()->Purge();
+  }
+
+  for (unsigned i = 0; i < num_conns; ++i) {
+    delete jobs[i];
+    delete sinks[i];
+  }
+  if ((result == kFailUnsupportedProtocol) || (result == kFailCanceled)) {
+    // Not usable as a parallel fetch; the caller restarts from scratch (or
+    // reports the cancellation)
+    info->sink()->Reset();
+  }
+  info->SetErrorCode(result);
+  return result;
+}
+
+
 /**
  * Downloads data from an insecure outside channel (currently HTTP or file).
  */
@@ -2247,6 +2430,16 @@ Failures DownloadManager::Fetch(JobInfo *info) {
   result = PrepareDownloadDestination(info);
   if (result != kFailOk)
     return result;
+
+  // Try the ranged, multi-connection path first.  kFailUnsupportedProtocol is
+  // its way of saying "this job is not a candidate", not a real failure, so
+  // anything else -- success or a genuine error -- is the final answer and
+  // only that sentinel falls through to the ordinary single-stream fetch.
+  if (opt_parallel_fetch_ > 1) {
+    result = FetchParallel(info);
+    if (result != kFailUnsupportedProtocol)
+      return result;
+  }
 
   if (info->expected_hash()) {
     const shash::Algorithms algorithm = info->expected_hash()->algorithm;
@@ -3481,6 +3674,12 @@ void DownloadManager::SetRetryParameters(const unsigned max_retries,
 }
 
 
+void DownloadManager::SetParallelFetch(const unsigned num_connections) {
+  const MutexLockGuard m(lock_options_);
+  opt_parallel_fetch_ = num_connections;
+}
+
+
 void DownloadManager::SetMaxIpaddrPerProxy(unsigned limit) {
   const MutexLockGuard m(lock_options_);
   resolver_->set_throttle(limit);
@@ -3553,6 +3752,7 @@ DownloadManager *DownloadManager::Clone(
   clone->opt_max_retries_ = opt_max_retries_;
   clone->opt_backoff_init_ms_ = opt_backoff_init_ms_;
   clone->opt_backoff_max_ms_ = opt_backoff_max_ms_;
+  clone->opt_parallel_fetch_ = opt_parallel_fetch_;
   clone->enable_info_header_ = enable_info_header_;
   clone->enable_http_tracing_ = enable_http_tracing_;
   clone->http_tracing_headers_ = http_tracing_headers_;

@@ -2362,6 +2362,10 @@ void MountPoint::SetupHttpTuning() {
     download_mgr_->SetMetalinkResetDelay(String2Uint64(optarg));
   if (options_mgr_->GetValue("CVMFS_HOST_RESET_AFTER", &optarg))
     download_mgr_->SetHostResetDelay(String2Uint64(optarg));
+  // Number of concurrent range requests for one large object; see
+  // FetchParallel() for which objects qualify.
+  if (options_mgr_->GetValue("CVMFS_PARALLEL_FETCH", &optarg))
+    download_mgr_->SetParallelFetch(String2Uint64(optarg));
 
   if (options_mgr_->GetValue("CVMFS_FOLLOW_REDIRECTS", &optarg)
       && options_mgr_->IsOn(optarg)) {

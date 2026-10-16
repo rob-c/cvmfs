@@ -54,6 +54,7 @@ void JobInfo::Init() {
   head_request_ = false;
   follow_redirects_ = false;
   force_nocache_ = false;
+  parallel_ok_ = false;
   pid_ = -1;
   uid_ = -1;
   gid_ = -1;

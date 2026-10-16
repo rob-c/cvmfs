@@ -183,6 +183,15 @@ class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
   DownloadManager *Clone(const perf::StatisticsTemplate &statistics,
                          const std::string &cloned_name);
   Failures Fetch(JobInfo *info);
+  /**
+   * Splits one large object into several concurrent range requests, which on a
+   * high-latency link recovers the throughput a single TCP stream cannot.
+   * Returns kFailUnsupportedProtocol when the job is not a candidate -- too
+   * small, no expected hash, a sink that pre-reserves, already a range request,
+   * single-threaded manager -- which the caller treats as "not applicable" and
+   * falls back to an ordinary fetch rather than as an error.
+   */
+  Failures FetchParallel(JobInfo *info);
 
   void SetCredentialsAttachment(CredentialsAttachment *ca);
   std::string GetDnsServer() const;
@@ -229,6 +238,7 @@ class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
   void SetRetryParameters(const unsigned max_retries,
                           const unsigned backoff_init_ms,
                           const unsigned backoff_max_ms);
+  void SetParallelFetch(const unsigned num_connections);
   void SetMaxIpaddrPerProxy(unsigned limit);
   void SetProxyTemplates(const std::string &direct, const std::string &forced);
   void EnableInfoHeader();
@@ -331,6 +341,9 @@ class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
   unsigned opt_max_retries_;
   unsigned opt_backoff_init_ms_;
   unsigned opt_backoff_max_ms_;
+  /** Split large objects into this many concurrent range requests, 0: off */
+  unsigned opt_parallel_fetch_;
+  FRIEND_TEST(T_Download, ParallelFetchSurvivesClone);
   bool enable_info_header_;
   bool opt_ipv4_only_;
   bool follow_redirects_;
