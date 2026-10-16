@@ -504,8 +504,10 @@ TEST_F(T_Download, ProxyDirectKeptAsLastResortTier) {
   EXPECT_EQ("http://127.0.0.1:3128", chain[0][0].url);
   ASSERT_EQ(1U, chain[1].size());
   EXPECT_EQ("DIRECT", chain[1][0].url);
-  // The proxy is where we start.
+  // The proxy is where we start, and direct connections are permitted only
+  // because the administrator asked for them.
   EXPECT_EQ(0U, current_group);
+  EXPECT_FALSE(download_mgr.opt_proxy_mandatory_);
 
   // With fallback proxies configured, DIRECT is dropped (the documented
   // behaviour): a DIRECT tier is terminal, so keeping it in front of the
@@ -518,6 +520,7 @@ TEST_F(T_Download, ProxyDirectKeptAsLastResortTier) {
   EXPECT_EQ("http://127.0.0.1:3128", chain[0][0].url);
   EXPECT_EQ("http://127.0.0.2:3128", chain[1][0].url);
   EXPECT_EQ(1U, fallback_group);
+  EXPECT_TRUE(download_mgr.opt_proxy_mandatory_);
 }
 
 
@@ -538,6 +541,7 @@ TEST_F(T_Download, ProxyDirectNotPeerOfLiveProxy) {
   ASSERT_EQ(1U, chain[1].size());
   EXPECT_EQ("DIRECT", chain[1][0].url);
   EXPECT_EQ(0U, current_group);
+  EXPECT_FALSE(download_mgr.opt_proxy_mandatory_);
 }
 
 
@@ -552,6 +556,7 @@ TEST_F(T_Download, ProxyDirectOnlyPreserved) {
   ASSERT_EQ(1U, chain.size());
   ASSERT_EQ(1U, chain[0].size());
   EXPECT_EQ("DIRECT", chain[0][0].url);
+  EXPECT_FALSE(download_mgr.opt_proxy_mandatory_);
 }
 
 
@@ -598,6 +603,90 @@ TEST_F(T_Download, StripDirect) {
   EXPECT_EQ("A|B;C|D;E|F|G", cleaned);
   EXPECT_TRUE(download_mgr.StripDirect("A|DIRECT;C|D;E|F;DIRECT", &cleaned));
   EXPECT_EQ("A;C|D;E|F", cleaned);
+}
+
+
+TEST_F(T_Download, SeparatorOnlyChainFailsClosed) {
+  // A proxy list that names something but normalises to nothing is a
+  // configuration error.  It must not quietly become "no proxy, go direct":
+  // the administrator asked for a proxy, so requests fail until it is fixed.
+  vector<vector<DownloadManager::ProxyInfo> > chain;
+  unsigned current_group = 42;
+  unsigned fallback_group = 42;
+  const char *garbage[] = { ";", "|", ";;", "|;|" };
+  for (unsigned i = 0; i < sizeof(garbage) / sizeof(garbage[0]); ++i) {
+    download_mgr.SetProxyChain(garbage[i], "", DownloadManager::kSetProxyBoth);
+    download_mgr.GetProxyInfo(&chain, &current_group, &fallback_group);
+    EXPECT_EQ(0U, chain.size()) << garbage[i];
+    EXPECT_TRUE(download_mgr.opt_proxy_mandatory_) << garbage[i];
+  }
+
+  // And it really does fail closed: the origin is never contacted directly.
+  string src_path = GetSmallFile();
+  MockFileServer origin(8133, sandbox_path_);
+  download_mgr.SetProxyChain(";", "", DownloadManager::kSetProxyBoth);
+  const string url = "http://127.0.0.1:8133/" + GetFileName(src_path);
+  cvmfs::MemSink sink;
+  JobInfo info(&url, false, false, NULL, &sink);
+  download_mgr.Fetch(&info);
+  EXPECT_NE(kFailOk, info.error_code());
+  EXPECT_EQ(0, origin.num_processed_requests())
+      << "a garbled proxy list sent the request unproxied";
+
+  // Whereas an empty list is genuinely "no proxy".
+  download_mgr.SetProxyChain("", "", DownloadManager::kSetProxyBoth);
+  EXPECT_FALSE(download_mgr.opt_proxy_mandatory_);
+}
+
+
+TEST_F(T_Download, RequiredProxySurvivesClone) {
+  // The external download manager is created as a clone, so the setting has
+  // to propagate or external data would quietly be allowed to go direct.
+  download_mgr.SetProxyChain("http://127.0.0.1:3128", "",
+                             DownloadManager::kSetProxyBoth);
+  EXPECT_TRUE(download_mgr.opt_proxy_mandatory_);
+  perf::Statistics stats;
+  DownloadManager *clone = download_mgr.Clone(
+      perf::StatisticsTemplate("clone", &stats), "clone");
+  EXPECT_TRUE(clone->opt_proxy_mandatory_);
+
+  // And a DIRECT-only chain must clone as "direct is allowed".
+  download_mgr.SetProxyChain("DIRECT", "", DownloadManager::kSetProxyBoth);
+  DownloadManager *clone2 = download_mgr.Clone(
+      perf::StatisticsTemplate("clone2", &stats), "clone2");
+  EXPECT_FALSE(clone2->opt_proxy_mandatory_);
+  delete clone;
+  delete clone2;
+}
+
+
+TEST_F(T_Download, ProxyWithoutDirectNeverLeaks) {
+  // No DIRECT anywhere in the chain: a dead proxy must fail the request, not
+  // silently bypass the proxy.
+  string src_path = GetSmallFile();
+  MockFileServer file_server(8098, sandbox_path_);
+
+  // Nothing listens on 8099 and no DIRECT tier is offered.
+  download_mgr.SetProxyChain("http://127.0.0.1:8099", "",
+                             DownloadManager::kSetProxyBoth);
+
+  string src_url = "http://127.0.0.1:8098/" + GetFileName(src_path);
+  cvmfs::MemSink memsink;
+  JobInfo info(&src_url, false /* compressed */, false /* probe hosts */, NULL,
+               &memsink);
+  download_mgr.Fetch(&info);
+
+  EXPECT_NE(kFailOk, info.error_code());
+  EXPECT_EQ(0, file_server.num_processed_requests());
+
+  // Positive control: the origin was reachable all along.
+  download_mgr.SetProxyChain("DIRECT", "", DownloadManager::kSetProxyBoth);
+  memsink.Reset();
+  JobInfo info_direct(&src_url, false /* compressed */,
+                      false /* probe hosts */, NULL, &memsink);
+  download_mgr.Fetch(&info_direct);
+  EXPECT_EQ(kFailOk, info_direct.error_code());
+  EXPECT_EQ(1, file_server.num_processed_requests());
 }
 
 

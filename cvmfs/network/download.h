@@ -120,6 +120,11 @@ class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
   FRIEND_TEST(T_Download, StripDirect);
   FRIEND_TEST(T_Download, ProxyDemoteDirect);
   FRIEND_TEST(T_Download, EscapeUrl);
+  FRIEND_TEST(T_Download, ProxyDirectKeptAsLastResortTier);
+  FRIEND_TEST(T_Download, ProxyDirectNotPeerOfLiveProxy);
+  FRIEND_TEST(T_Download, ProxyDirectOnlyPreserved);
+  FRIEND_TEST(T_Download, SeparatorOnlyChainFailsClosed);
+  FRIEND_TEST(T_Download, RequiredProxySurvivesClone);
 
  public:
   // HostInfo is used for both metalink and host
@@ -378,6 +383,16 @@ class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
    * Overall number of proxies summed over all the groups.
    */
   unsigned opt_num_proxies_;
+  /**
+   * True when a real (non-DIRECT) proxy is configured and the configuration
+   * offers no DIRECT tier to fall back on.  While this holds, a direct
+   * connection is never an acceptable substitute for the proxy and requests
+   * are failed instead of silently bypassing it.  Writing DIRECT into the
+   * chain, as in "proxy;DIRECT", clears the flag and re-enables an unproxied
+   * last resort -- reached only once the proxy has actually failed, see
+   * DemoteDirect().  Configurations with no proxy at all also leave it false.
+   */
+  bool opt_proxy_mandatory_;
   /**
    * The original proxy list provided to SetProxyChain.
    */

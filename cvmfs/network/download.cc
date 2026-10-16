@@ -1034,8 +1034,20 @@ void DownloadManager::SetUrlOptions(JobInfo *info) {
 
     ProxyInfo *proxy = ChooseProxyUnlocked(info->expected_hash());
     if (!proxy || (proxy->url == "DIRECT")) {
-      info->SetProxy("DIRECT");
-      curl_easy_setopt(info->curl_handle(), CURLOPT_PROXY, "");
+      if (opt_proxy_mandatory_) {
+        // No configured proxy is usable.  Connecting directly would bypass
+        // the site proxy, so fail the request instead and let the normal
+        // retry and fail-over path report the outage.
+        LogCvmfs(kLogDownload, kLogSyslogErr | kLogDebug,
+                 "(manager '%s' - id %" PRId64 ") "
+                 "no usable proxy available, refusing to connect directly",
+                 name_.c_str(), info->id());
+        info->SetProxy("BLOCKED");
+        curl_easy_setopt(info->curl_handle(), CURLOPT_PROXY, "0.0.0.0:1");
+      } else {
+        info->SetProxy("DIRECT");
+        curl_easy_setopt(info->curl_handle(), CURLOPT_PROXY, "");
+      }
     } else {
       // Note: inside ValidateProxyIpsUnlocked() we may change the proxy data
       // structure, so we must not pass proxy->... (== current_proxy())
@@ -1916,6 +1928,7 @@ DownloadManager::DownloadManager(const unsigned max_pool_handles,
     , opt_proxy_groups_current_burned_(0)
     , opt_proxy_groups_fallback_(0)
     , opt_num_proxies_(0)
+    , opt_proxy_mandatory_(false)
     , opt_proxy_shard_(false)
     , failover_indefinitely_(false)
     , name_(name)
@@ -2983,6 +2996,23 @@ void DownloadManager::SetProxyChain(const string &proxy_list,
              name_.c_str(), opt_proxy_list_.c_str(), set_proxy_list.c_str());
   }
 
+  // Direct connections are forbidden whenever something other than DIRECT was
+  // asked for.  That is judged on the raw configuration: a list that names a
+  // proxy but normalises to nothing (";", "|", a typo) fails closed rather
+  // than quietly sending everything unproxied.
+  {
+    const bool configured = (opt_proxy_list_ != "")
+                            || (set_proxy_fallback_list != "");
+    opt_proxy_mandatory_ = configured && !has_direct_group;
+    if ((opt_proxy_list_ != "") && (set_proxy_list == "")
+        && (set_proxy_fallback_list == "")) {
+      LogCvmfs(kLogDownload, kLogSyslogErr | kLogDebug,
+               "(manager '%s') proxy list '%s' contains no usable proxy; "
+               "refusing to connect directly",
+               name_.c_str(), opt_proxy_list_.c_str());
+    }
+  }
+
   // From this point on, use set_proxy_list and set_fallback_proxy_list as
   // effective proxy lists!
 
@@ -3408,6 +3438,7 @@ void DownloadManager::CloneProxyConfig(DownloadManager *clone) {
   clone->opt_proxy_groups_current_burned_ = opt_proxy_groups_current_burned_;
   clone->opt_proxy_groups_fallback_ = opt_proxy_groups_fallback_;
   clone->opt_num_proxies_ = opt_num_proxies_;
+  clone->opt_proxy_mandatory_ = opt_proxy_mandatory_;
   clone->opt_proxy_shard_ = opt_proxy_shard_;
   clone->opt_proxy_list_ = opt_proxy_list_;
   clone->opt_proxy_fallback_list_ = opt_proxy_fallback_list_;
