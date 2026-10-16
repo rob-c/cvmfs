@@ -2837,6 +2837,63 @@ bool DownloadManager::ValidateGeoReply(const string &reply_order,
 
 
 /**
+ * Keeps DIRECT as a failover tier of its own but never as a peer of a real
+ * proxy.
+ *
+ * "proxy;DIRECT" is the documented way of asking for "use the proxy, and only
+ * if it has failed connect directly".  Load-balance groups, however, are
+ * chosen from at random, so a DIRECT sharing a group with a real proxy
+ * ("proxy|DIRECT") would send a share of the traffic unproxied while the
+ * proxy is perfectly healthy.  DIRECT is therefore taken out of any group that
+ * also holds a real proxy and moved to a group of its own at the end of the
+ * chain (a DIRECT-only group is kept where it is).  Because proxy groups are
+ * tried in order, that DIRECT group is only reached after every proxy in the
+ * preceding groups has been burned: "a|DIRECT" behaves like "a;DIRECT".
+ *
+ * *has_direct_group is set when such a DIRECT-only group survives.
+ */
+string DownloadManager::DemoteDirect(const string &proxy_list,
+                                     bool *has_direct_group) {
+  assert(has_direct_group);
+  *has_direct_group = false;
+  if (proxy_list == "")
+    return "";
+
+  const vector<string> groups = SplitString(proxy_list, ';');
+  vector<string> kept_groups;
+  bool demoted = false;
+  for (unsigned i = 0; i < groups.size(); ++i) {
+    const vector<string> members = SplitString(groups[i], '|');
+    vector<string> real_members;
+    bool group_has_direct = false;
+    for (unsigned j = 0; j < members.size(); ++j) {
+      if (members[j] == "DIRECT") {
+        group_has_direct = true;
+        continue;
+      }
+      if (members[j] == "")
+        continue;
+      real_members.push_back(members[j]);
+    }
+    if (!real_members.empty()) {
+      kept_groups.push_back(JoinStrings(real_members, "|"));
+      if (group_has_direct)
+        demoted = true;
+    } else if (group_has_direct) {
+      kept_groups.push_back("DIRECT");
+      *has_direct_group = true;
+    }
+  }
+  if (demoted && !*has_direct_group) {
+    kept_groups.push_back("DIRECT");
+    *has_direct_group = true;
+  }
+
+  return JoinStrings(kept_groups, ";");
+}
+
+
+/**
  * Removes DIRECT from a list of ';' and '|' separated proxies.
  * \return true if DIRECT was present, false otherwise
  */
@@ -2901,15 +2958,29 @@ void DownloadManager::SetProxyChain(const string &proxy_list,
              "(manager '%s') fallback proxies do not support DIRECT, removing",
              name_.c_str());
   }
-  if (set_proxy_fallback_list == "") {
-    set_proxy_list = opt_proxy_list_;
-  } else {
-    const bool contains_direct = StripDirect(opt_proxy_list_, &set_proxy_list);
-    if (contains_direct) {
-      LogCvmfs(kLogDownload, kLogSyslog | kLogDebug,
-               "(manager '%s') skipping DIRECT proxy to use fallback proxy",
-               name_.c_str());
-    }
+  // Keep a DIRECT tier if one was configured, but never let DIRECT compete
+  // with a healthy proxy inside a load-balance group: "proxy;DIRECT" means
+  // "use the proxy, and connect directly only once it has failed".
+  bool has_direct_group = false;
+  set_proxy_list = DemoteDirect(opt_proxy_list_, &has_direct_group);
+  if (has_direct_group && (set_proxy_fallback_list != "")) {
+    // Fallback proxies are appended behind the regular groups and a DIRECT
+    // group is terminal (a DIRECT failure is a host failure), so a DIRECT tier
+    // in front of them would make them unreachable.  Keep the documented
+    // behaviour: with fallback proxies configured, DIRECT is not used.
+    string stripped;
+    StripDirect(set_proxy_list, &stripped);
+    set_proxy_list = stripped;
+    has_direct_group = false;
+    LogCvmfs(kLogDownload, kLogSyslog | kLogDebug,
+             "(manager '%s') skipping DIRECT proxy to use fallback proxy",
+             name_.c_str());
+  }
+  if (set_proxy_list != opt_proxy_list_) {
+    LogCvmfs(kLogDownload, kLogSyslog | kLogDebug,
+             "(manager '%s') proxy chain '%s' normalised to '%s': DIRECT is "
+             "only used as a last resort, never alongside a live proxy",
+             name_.c_str(), opt_proxy_list_.c_str(), set_proxy_list.c_str());
   }
 
   // From this point on, use set_proxy_list and set_fallback_proxy_list as

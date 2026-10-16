@@ -442,6 +442,140 @@ TEST_F(T_Download, LocalFile2Sink) {
 }
 
 
+TEST_F(T_Download, ProxyDemoteDirect) {
+  bool has_direct = true;
+  EXPECT_EQ("", download_mgr.DemoteDirect("", &has_direct));
+  EXPECT_FALSE(has_direct);
+
+  // DIRECT on its own stays a tier.
+  EXPECT_EQ("DIRECT", download_mgr.DemoteDirect("DIRECT", &has_direct));
+  EXPECT_TRUE(has_direct);
+  EXPECT_EQ("DIRECT", download_mgr.DemoteDirect("DIRECT|DIRECT", &has_direct));
+  EXPECT_TRUE(has_direct);
+
+  // Sharing a load-balance group with a real proxy is not allowed: DIRECT
+  // would take a share of the traffic while the proxy is healthy.  It is
+  // moved to a tier of its own at the end, not thrown away -- the
+  // administrator did ask for direct connections.
+  EXPECT_EQ("A;DIRECT", download_mgr.DemoteDirect("A|DIRECT", &has_direct));
+  EXPECT_TRUE(has_direct);
+  EXPECT_EQ("A|B;DIRECT", download_mgr.DemoteDirect("A|DIRECT|B",
+                                                    &has_direct));
+  EXPECT_TRUE(has_direct);
+  EXPECT_EQ("A;B;DIRECT", download_mgr.DemoteDirect("A|DIRECT;B",
+                                                    &has_direct));
+  EXPECT_TRUE(has_direct);
+
+  // Separator-only input normalises to nothing.
+  EXPECT_EQ("", download_mgr.DemoteDirect(";", &has_direct));
+  EXPECT_FALSE(has_direct);
+  EXPECT_EQ("", download_mgr.DemoteDirect("|", &has_direct));
+  EXPECT_FALSE(has_direct);
+  EXPECT_EQ("", download_mgr.DemoteDirect(";;", &has_direct));
+  EXPECT_FALSE(has_direct);
+
+  // A group of its own is kept, and stays in the position it was written in.
+  EXPECT_EQ("A;DIRECT", download_mgr.DemoteDirect("A;DIRECT", &has_direct));
+  EXPECT_TRUE(has_direct);
+  EXPECT_EQ("A;DIRECT;B", download_mgr.DemoteDirect("A;DIRECT;B",
+                                                    &has_direct));
+  EXPECT_TRUE(has_direct);
+  EXPECT_EQ("A;DIRECT", download_mgr.DemoteDirect("A|DIRECT;DIRECT",
+                                                  &has_direct));
+  EXPECT_TRUE(has_direct);
+
+  // Chains without DIRECT are passed through untouched.
+  EXPECT_EQ("A|B;C", download_mgr.DemoteDirect("A|B;C", &has_direct));
+  EXPECT_FALSE(has_direct);
+}
+
+
+TEST_F(T_Download, ProxyDirectKeptAsLastResortTier) {
+  vector<vector<DownloadManager::ProxyInfo> > chain;
+  unsigned current_group = 42;
+  unsigned fallback_group = 42;
+
+  // "proxy;DIRECT" must keep DIRECT as a separate, later tier.
+  download_mgr.SetProxyChain("http://127.0.0.1:3128;DIRECT", "",
+                             DownloadManager::kSetProxyBoth);
+  download_mgr.GetProxyInfo(&chain, &current_group, &fallback_group);
+  ASSERT_EQ(2U, chain.size());
+  ASSERT_EQ(1U, chain[0].size());
+  EXPECT_EQ("http://127.0.0.1:3128", chain[0][0].url);
+  ASSERT_EQ(1U, chain[1].size());
+  EXPECT_EQ("DIRECT", chain[1][0].url);
+  // The proxy is where we start.
+  EXPECT_EQ(0U, current_group);
+
+  // With fallback proxies configured, DIRECT is dropped (the documented
+  // behaviour): a DIRECT tier is terminal, so keeping it in front of the
+  // fallback groups would make them unreachable.
+  download_mgr.SetProxyChain("http://127.0.0.1:3128;DIRECT",
+                             "http://127.0.0.2:3128",
+                             DownloadManager::kSetProxyBoth);
+  download_mgr.GetProxyInfo(&chain, &current_group, &fallback_group);
+  ASSERT_EQ(2U, chain.size());
+  EXPECT_EQ("http://127.0.0.1:3128", chain[0][0].url);
+  EXPECT_EQ("http://127.0.0.2:3128", chain[1][0].url);
+  EXPECT_EQ(1U, fallback_group);
+}
+
+
+TEST_F(T_Download, ProxyDirectNotPeerOfLiveProxy) {
+  vector<vector<DownloadManager::ProxyInfo> > chain;
+  unsigned current_group = 42;
+  unsigned fallback_group = 42;
+
+  // "proxy|DIRECT" would otherwise load-balance unproxied traffic against a
+  // healthy proxy.  It becomes "proxy;DIRECT": the proxy first, DIRECT only
+  // once the proxy has failed -- but still available, since it was asked for.
+  download_mgr.SetProxyChain("http://127.0.0.1:3128|DIRECT", "",
+                             DownloadManager::kSetProxyBoth);
+  download_mgr.GetProxyInfo(&chain, &current_group, &fallback_group);
+  ASSERT_EQ(2U, chain.size());
+  ASSERT_EQ(1U, chain[0].size());
+  EXPECT_EQ("http://127.0.0.1:3128", chain[0][0].url);
+  ASSERT_EQ(1U, chain[1].size());
+  EXPECT_EQ("DIRECT", chain[1][0].url);
+  EXPECT_EQ(0U, current_group);
+}
+
+
+TEST_F(T_Download, ProxyDirectOnlyPreserved) {
+  vector<vector<DownloadManager::ProxyInfo> > chain;
+  unsigned current_group = 42;
+  unsigned fallback_group = 42;
+
+  // Nothing but DIRECT is a deliberate choice: leave unproxied setups alone.
+  download_mgr.SetProxyChain("DIRECT", "", DownloadManager::kSetProxyBoth);
+  download_mgr.GetProxyInfo(&chain, &current_group, &fallback_group);
+  ASSERT_EQ(1U, chain.size());
+  ASSERT_EQ(1U, chain[0].size());
+  EXPECT_EQ("DIRECT", chain[0][0].url);
+}
+
+
+TEST_F(T_Download, ProxyHealthyProxyIsUsedNotDirect) {
+  // With "proxy;DIRECT" and a healthy proxy, every request must go through
+  // the proxy; the DIRECT tier must stay untouched.
+  string src_path = GetSmallFile();
+  MockFileServer file_server(8094, sandbox_path_);
+  MockProxyServer proxy_server(8095);
+  download_mgr.SetProxyChain("http://127.0.0.1:8095;DIRECT", "",
+                             DownloadManager::kSetProxyBoth);
+
+  string src_url = "http://127.0.0.1:8094/" + GetFileName(src_path);
+  cvmfs::MemSink memsink;
+  JobInfo info(&src_url, false /* compressed */, false /* probe hosts */, NULL,
+               &memsink);
+  download_mgr.Fetch(&info);
+
+  EXPECT_EQ(kFailOk, info.error_code());
+  EXPECT_EQ(1, proxy_server.num_processed_requests());
+  EXPECT_EQ("http://127.0.0.1:8095", info.proxy());
+}
+
+
 TEST_F(T_Download, StripDirect) {
   string cleaned = "FALSE";
   EXPECT_FALSE(download_mgr.StripDirect("", &cleaned));

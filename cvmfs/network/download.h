@@ -118,6 +118,7 @@ class CredentialsAttachment {
 class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
   FRIEND_TEST(T_Download, ValidateGeoReply);
   FRIEND_TEST(T_Download, StripDirect);
+  FRIEND_TEST(T_Download, ProxyDemoteDirect);
   FRIEND_TEST(T_Download, EscapeUrl);
 
  public:
@@ -265,6 +266,8 @@ class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
   static void *MainDownload(void *data);
 
   bool StripDirect(const std::string &proxy_list, std::string *cleaned_list);
+  std::string DemoteDirect(const std::string &proxy_list,
+                           bool *has_direct_group);
   bool ValidateGeoReply(const std::string &reply_order,
                         const unsigned expected_size,
                         std::vector<uint64_t> *reply_vals);
