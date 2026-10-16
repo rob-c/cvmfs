@@ -241,6 +241,27 @@ TEST_F(T_Download, RemoteFileRedirect) {
   EXPECT_STREQ(reinterpret_cast<char *>(memsink.data()), src_content.c_str());
 }
 
+TEST_F(T_Download, UnresolvableProxyIsRetriedAsDnsFailure) {
+  // A proxy name that does not resolve used to surface as a connection
+  // failure (the client points it at a sentinel address that is refused), and
+  // name-resolution failures were never retried.  It is now reported as the
+  // resolve failure it is and retried like one before giving up on the proxy.
+  download_mgr.SetProxyChain("http://proxy.does-not-exist.invalid:3128", "",
+                             DownloadManager::kSetProxyBoth);
+  download_mgr.SetRetryParameters(2, 0, 0);
+  download_mgr.SetTimeout(1, 1);
+
+  const string url = "http://127.0.0.1:8135/object";
+  cvmfs::MemSink sink;
+  JobInfo info(&url, false, false, NULL, &sink);
+  download_mgr.Fetch(&info);
+
+  EXPECT_EQ(kFailProxyResolve, info.error_code());
+  EXPECT_GE(static_cast<int>(info.num_retries()), 2)
+      << "the resolve failure was not retried";
+}
+
+
 TEST_F(T_Download, RemoteFileSimpleProxy) {
   string src_path = GetSmallFile();
   string src_content = GetFileContents(src_path);

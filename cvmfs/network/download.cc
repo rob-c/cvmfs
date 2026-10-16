@@ -1033,6 +1033,7 @@ void DownloadManager::SetUrlOptions(JobInfo *info) {
       }
     }
 
+    info->SetProxyUnresolved(false);
     ProxyInfo *proxy = ChooseProxyUnlocked(info->expected_hash());
     if (!proxy || (proxy->url == "DIRECT")) {
       info->SetProxy("DIRECT");
@@ -1053,7 +1054,10 @@ void DownloadManager::SetUrlOptions(JobInfo *info) {
         curl_easy_setopt(info->curl_handle(), CURLOPT_PROXY,
                          info->proxy().c_str());
       } else {
-        // We know it can't work, don't even try to download
+        // We know it can't work, don't even try to download.  The refusal
+        // this produces is reported as a resolve failure, see
+        // VerifyAndFinalize().
+        info->SetProxyUnresolved(true);
         curl_easy_setopt(info->curl_handle(), CURLOPT_PROXY, "0.0.0.0");
       }
     }
@@ -1281,7 +1285,9 @@ bool DownloadManager::CanRetry(const JobInfo *info) {
   const unsigned max_retries = opt_max_retries_;
 
   const bool retryable_error = IsProxyTransferError(info->error_code())
-                               || IsHostTransferError(info->error_code());
+                               || IsHostTransferError(info->error_code())
+                               || (info->error_code() == kFailHostResolve)
+                               || (info->error_code() == kFailProxyResolve);
   if (info->nocache() || !retryable_error)
     return false;
   if (max_retries == 0)
@@ -1548,6 +1554,13 @@ bool DownloadManager::VerifyAndFinalize(const int curl_error, JobInfo *info) {
       break;
     case CURLE_FILE_COULDNT_READ_FILE:
     case CURLE_COULDNT_CONNECT:
+      if (info->proxy_unresolved()) {
+        // Pointed at the 0.0.0.0 sentinel because the proxy name did not
+        // resolve; the kernel refuses that at once.  That is a resolution
+        // failure, not a connection problem with a real proxy.
+        info->SetErrorCode(kFailProxyResolve);
+        break;
+      }
       if (info->proxy() != "DIRECT") {
         // This is a guess.  Fail-over can still change to switching host
         info->SetErrorCode(kFailProxyConnection);
@@ -1750,10 +1763,23 @@ bool DownloadManager::VerifyAndFinalize(const int curl_error, JobInfo *info) {
           SetNocache(info);
           break;
         case kFailProxyResolve:
+          // A lost DNS packet is not a dead proxy: retry before switching
+          if (same_url_retry) {
+            Backoff(info);
+          } else {
+            switch_proxy = true;
+          }
+          break;
         case kFailProxyHttp:
           switch_proxy = true;
           break;
         case kFailHostResolve:
+          if (same_url_retry) {
+            Backoff(info);
+          } else {
+            switch_host = true;
+          }
+          break;
         case kFailHostHttp:
         case kFailHostAfterProxy:
           switch_host = true;

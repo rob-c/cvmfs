@@ -98,6 +98,8 @@ class JobInfo {
   z_stream zstream_;
   shash::ContextPtr hash_context_;
   std::string proxy_;
+  /** The name of the chosen proxy did not resolve; a sentinel was used */
+  bool proxy_unresolved_;
   std::string link_;
   bool nocache_;
   Failures error_code_;
@@ -202,6 +204,7 @@ class JobInfo {
   z_stream zstream() const { return zstream_; }
   shash::ContextPtr hash_context() const { return hash_context_; }
   std::string proxy() const { return proxy_; }
+  bool proxy_unresolved() const { return proxy_unresolved_; }
   std::string link() const { return link_; }
   bool nocache() const { return nocache_; }
   Failures error_code() const { return error_code_; }
@@ -259,6 +262,7 @@ class JobInfo {
     hash_context_ = hash_context;
   }
   void SetProxy(const std::string &proxy) { proxy_ = proxy; }
+  void SetProxyUnresolved(bool v) { proxy_unresolved_ = v; }
   void SetLink(const std::string &link) { link_ = link; }
   void SetNocache(bool nocache) { nocache_ = nocache; }
   void SetErrorCode(Failures error_code) { error_code_ = error_code; }

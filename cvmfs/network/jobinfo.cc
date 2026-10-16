@@ -75,6 +75,7 @@ void JobInfo::Init() {
   nocache_ = false;
   error_code_ = kFailOther;
   http_code_ = -1;
+  proxy_unresolved_ = false;
   link_ = "";
   num_used_proxies_ = 0;
   num_used_metalinks_ = 0;
