@@ -868,7 +868,7 @@ void DownloadManager::ReleaseCurlHandle(CURL *handle, bool allow_reuse) {
   const set<CURL *>::iterator elem = pool_handles_inuse_->find(handle);
   assert(elem != pool_handles_inuse_->end());
 
-  if (!allow_reuse || pool_handles_idle_->size() > pool_max_handles_) {
+  if (!allow_reuse || (pool_handles_idle_->size() >= pool_max_handles_)) {
     curl_easy_cleanup(*elem);
   } else {
     pool_handles_idle_->insert(*elem);

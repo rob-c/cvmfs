@@ -397,6 +397,22 @@ TEST_F(T_Download, RemoteFileEmpty) {
   ASSERT_EQ(memsink.pos(), 0U);
 }
 
+TEST_F(T_Download, CurlHandlePoolRespectsMaximum) {
+  // Every idle handle can hold a keep-alive connection open, so the pool must
+  // not grow past the configured maximum.
+  const uint32_t max_handles = download_mgr.pool_max_handles_;
+  std::vector<CURL *> handles;
+  for (unsigned i = 0; i < max_handles + 4; ++i)
+    handles.push_back(download_mgr.AcquireCurlHandle());
+  for (unsigned i = 0; i < handles.size(); ++i)
+    download_mgr.ReleaseCurlHandle(handles[i], true /* allow_reuse */);
+
+  EXPECT_LE(download_mgr.pool_handles_idle_->size(),
+            static_cast<size_t>(max_handles));
+  EXPECT_TRUE(download_mgr.pool_handles_inuse_->empty());
+}
+
+
 TEST_F(T_Download, LocalFile2Sink) {
   string dest_path;
   FILE *fdest = CreateTemporaryFile(&dest_path);
