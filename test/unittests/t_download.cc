@@ -287,6 +287,52 @@ TEST_F(T_Download, RemoteFileProxyRedirect) {
   EXPECT_STREQ(reinterpret_cast<char *>(memsink.data()), src_content.c_str());
 }
 
+namespace {
+// Accepts the request and then sits on it past any client timeout.
+HTTPResponse StallingHandler(const HTTPRequest &, void *data) {
+  int *stalls = static_cast<int *>(data);
+  (*stalls)++;
+  SafeSleepMs(3000);
+  HTTPResponse response;
+  response.code = 200;
+  response.body = "too late";
+  return response;
+}
+}  // namespace
+
+
+TEST_F(T_Download, TimeoutQuarantinesThePooledConnections) {
+  // After a timeout the manager arms opt_fresh_connect_until_, so that for one
+  // timeout period every request opens its own connection instead of reaching
+  // for a pooled one.  A middlebox that has silently dropped an idle flow
+  // leaves no trace on the pooled socket, so reusing it would burn another
+  // full timeout; this is what stops that repeating.
+  // Only a connection that came up and then went silent implicates the
+  // pool, so the proxy here accepts the connection and never answers.
+  EXPECT_EQ(0, download_mgr.opt_fresh_connect_until_);
+  int stalls = 0;
+  MockHTTPServer stalling_proxy(8117);
+  ASSERT_TRUE(stalling_proxy.SetResponseCallback(StallingHandler, &stalls));
+  ASSERT_TRUE(stalling_proxy.Start());
+
+  download_mgr.SetProxyChain("http://127.0.0.1:8117", "",
+                             DownloadManager::kSetProxyBoth);
+  download_mgr.SetRetryParameters(0, 0, 0);
+  download_mgr.SetTimeout(1, 1);
+
+  const string url = "http://127.0.0.1:8128/object";
+  cvmfs::MemSink sink;
+  JobInfo info(&url, false, false, NULL, &sink);
+  const time_t before = time(NULL);
+  download_mgr.Fetch(&info);
+
+  EXPECT_EQ(kFailProxyTooSlow, info.error_code());
+  EXPECT_GE(download_mgr.opt_fresh_connect_until_, before)
+      << "a stalled connection did not quarantine the pool";
+  stalling_proxy.Stop();
+}
+
+
 TEST_F(T_Download, LocalFile2Mem) {
   string src_path = GetSmallFile();
   string src_content = GetFileContents(src_path);

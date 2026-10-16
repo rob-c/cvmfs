@@ -133,6 +133,35 @@ static Failures PrepareDownloadDestination(JobInfo *info) {
 
 
 /**
+ * True when the TCP connect for this transfer completed, whatever happened
+ * afterwards.  It tells a peer that never answered apart from one that
+ * answered and then misbehaved.
+ *
+ * CURLINFO_CONNECT_TIME_T arrived in libcurl 7.61.0 but the build accepts
+ * 7.55.0 (see externals/libcurl/CMakeLists.txt), so fall back to the
+ * double-valued CURLINFO_CONNECT_TIME, which carries the same meaning at
+ * lower resolution.
+ */
+static bool ConnectCompleted(CURL *handle) {
+#if LIBCURL_VERSION_NUM >= 0x073d00  // 7.61.0
+  curl_off_t connect_time = 0;
+  if (curl_easy_getinfo(handle, CURLINFO_CONNECT_TIME_T, &connect_time)
+      != CURLE_OK) {
+    return false;
+  }
+  return connect_time > 0;
+#else
+  double connect_time = 0.0;
+  if (curl_easy_getinfo(handle, CURLINFO_CONNECT_TIME, &connect_time)
+      != CURLE_OK) {
+    return false;
+  }
+  return connect_time > 0.0;
+#endif
+}
+
+
+/**
  * Called by curl for every HTTP header. Not called for file:// transfers.
  */
 static size_t CallbackCurlHeader(void *ptr, size_t size, size_t nmemb,
@@ -1061,6 +1090,14 @@ void DownloadManager::SetUrlOptions(JobInfo *info) {
   // Check if metalink and host chains need to be reset
   CheckHostInfoReset("metalink", opt_metalink_, info, now);
   CheckHostInfoReset("host", opt_host_, info, now);
+  if (opt_fresh_connect_until_ > 0) {
+    if (now == 0)
+      now = time(NULL);
+    if (now < opt_fresh_connect_until_)
+      curl_easy_setopt(curl_handle, CURLOPT_FRESH_CONNECT, 1L);
+    else
+      opt_fresh_connect_until_ = 0;
+  }
 
   curl_easy_setopt(curl_handle, CURLOPT_LOW_SPEED_LIMIT, opt_low_speed_limit_);
   if (info->proxy() != "DIRECT") {
@@ -1520,6 +1557,21 @@ bool DownloadManager::VerifyAndFinalize(const int curl_error, JobInfo *info) {
     case CURLE_OPERATION_TIMEDOUT:
       info->SetErrorCode((info->proxy() == "DIRECT") ? kFailHostTooSlow
                                                      : kFailProxyTooSlow);
+      // Quarantine the connection pool for one timeout period (see
+      // opt_fresh_connect_until_).  Only a connection that came up and then
+      // stalled implicates the pooled connections; and a quarantine already
+      // running is not extended, or a saturated peer would keep it open
+      // indefinitely.
+      if (ConnectCompleted(info->curl_handle())) {
+        const MutexLockGuard m(lock_options_);
+        const time_t now = time(NULL);
+        if (now >= opt_fresh_connect_until_) {
+          opt_fresh_connect_until_ = now
+                                     + ((info->proxy() == "DIRECT")
+                                            ? opt_timeout_direct_
+                                            : opt_timeout_proxy_);
+        }
+      }
       break;
     case CURLE_PARTIAL_FILE:
     case CURLE_GOT_NOTHING:
@@ -1898,6 +1950,7 @@ DownloadManager::DownloadManager(const unsigned max_pool_handles,
     , watch_fds_max_(4 * max_pool_handles)
     , opt_timeout_proxy_(5)
     , opt_timeout_direct_(10)
+    , opt_fresh_connect_until_(0)
     , opt_low_speed_limit_(1024)
     , opt_max_retries_(0)
     , opt_backoff_init_ms_(0)

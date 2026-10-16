@@ -326,6 +326,14 @@ class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
   std::string info_header_template_;
   unsigned opt_timeout_proxy_;
   unsigned opt_timeout_direct_;
+  /**
+   * Until this time, new requests bypass libcurl's connection pool.  Set when
+   * a connection came up and then stalled into a timeout: the other pooled
+   * connections were idle for as long as that one and were most likely killed
+   * by the same middlebox.
+   */
+  time_t opt_fresh_connect_until_;
+  FRIEND_TEST(T_Download, TimeoutQuarantinesThePooledConnections);
   unsigned opt_low_speed_limit_;
   unsigned opt_max_retries_;
   unsigned opt_backoff_init_ms_;
