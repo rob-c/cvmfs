@@ -258,9 +258,13 @@ void *MockHTTPServer::Main(void *data) {
     // Mandatory since the connection is closed after replying
     response.AddHeader("Connection", "close");
     std::string reply = response.ToString();
-    int bytes_written = write(accept_sockfd, reply.c_str(), reply.length());
-    assert(bytes_written >= 0);
-    assert((uint64_t)bytes_written == reply.length());
+    // The client may close the connection before the whole reply is out --
+    // a header-time abort does exactly that -- so a short write or EPIPE is
+    // the peer leaving, not a server error.  MSG_NOSIGNAL keeps the process
+    // from being killed by SIGPIPE in that case.
+    const ssize_t bytes_written = send(accept_sockfd, reply.c_str(),
+                                       reply.length(), MSG_NOSIGNAL);
+    (void) bytes_written;
     close(accept_sockfd);
   }
   close(listen_sockfd);

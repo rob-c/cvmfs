@@ -87,6 +87,14 @@ class JobInfo {
   // Allow byte ranges to be specified.
   off_t range_offset_;
   off_t range_size_;
+  /** Bytes of this object already received in earlier attempts (resume) */
+  uint64_t resume_offset_;
+  /** Content-Length of the last response, -1 if none */
+  int64_t content_length_;
+  /** Retries granted for free because the attempt made progress */
+  unsigned free_retries_;
+  /** Set once the peer has shown it does not honour Range on this object */
+  bool resume_disabled_;
 
   // Internal state
   CURL *curl_handle_;
@@ -194,6 +202,10 @@ class JobInfo {
 
   off_t range_offset() const { return range_offset_; }
   off_t range_size() const { return range_size_; }
+  uint64_t resume_offset() const { return resume_offset_; }
+  int64_t content_length() const { return content_length_; }
+  unsigned free_retries() const { return free_retries_; }
+  bool resume_disabled() const { return resume_disabled_; }
 
   CURL *curl_handle() const { return curl_handle_; }
   curl_slist *headers() const { return headers_; }
@@ -244,6 +256,10 @@ class JobInfo {
 
   void SetRangeOffset(off_t range_offset) { range_offset_ = range_offset; }
   void SetRangeSize(off_t range_size) { range_size_ = range_size; }
+  void SetResumeOffset(uint64_t offset) { resume_offset_ = offset; }
+  void SetContentLength(int64_t length) { content_length_ = length; }
+  void SetFreeRetries(unsigned v) { free_retries_ = v; }
+  void SetResumeDisabled(bool v) { resume_disabled_ = v; }
 
   void SetCurlHandle(CURL *curl_handle) { curl_handle_ = curl_handle; }
   void SetHeaders(curl_slist *headers) { headers_ = headers; }

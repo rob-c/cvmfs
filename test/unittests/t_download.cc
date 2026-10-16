@@ -178,6 +178,310 @@ TEST_F(T_Download, Clone) {
 }
 
 
+namespace {
+// A server that cuts the first response short, so the client has to resume.
+// The second and later requests are served in full, honouring Range.
+struct ResumeState {
+  ResumeState() : requests(0), cut_responses(1), honour_range(true),
+                  saw_range(false), range_first_byte(0) { }
+  int requests;
+  int cut_responses;  ///< how many replies are truncated before a full one
+  bool honour_range;
+  bool saw_range;
+  uint64_t range_first_byte;
+  std::string content;
+};
+
+HTTPResponse ResumeHandler(const HTTPRequest &req, void *data) {
+  ResumeState *st = static_cast<ResumeState *>(data);
+  st->requests++;
+
+  uint64_t range_from = 0;
+  bool has_range = false;
+  for (HTTPHeaderList::const_iterator i = req.headers.begin();
+       i != req.headers.end(); ++i) {
+    if (i->first == "Range") {
+      has_range = true;
+      st->saw_range = true;
+      unsigned long long f = 0;  // NOLINT(runtime/int)
+      sscanf(i->second.c_str(), "bytes=%llu", &f);
+      range_from = f;
+      st->range_first_byte = range_from;
+    }
+  }
+
+  HTTPResponse response;
+  if (st->requests <= st->cut_responses) {
+    // Announce what is left but deliver only part of it, then the mock server
+    // closes the connection: a classic short transfer.  Each cut reply still
+    // carries enough bytes to count as progress.
+    // A server that does not honour Range answers it with a 200 and the
+    // whole object, cut short like everything else it sends.
+    if (!st->honour_range) {
+      range_from = 0;
+    }
+    const size_t total_left = st->content.length() - range_from;
+    const size_t cut = total_left / 2;
+    response.raw = true;
+    response.body = string((has_range && st->honour_range)
+                               ? "HTTP/1.1 206 Partial Content"
+                               : "HTTP/1.1 200 OK")
+                    + "\r\nContent-Length: " + StringifyUint(total_left)
+                    + "\r\n\r\n" + st->content.substr(range_from, cut);
+    return response;
+  }
+
+  if (has_range && st->honour_range) {
+    response.raw = true;
+    response.body = "HTTP/1.1 206 Partial Content\r\nContent-Length: "
+                    + StringifyUint(st->content.length() - range_from)
+                    + "\r\n\r\n" + st->content.substr(range_from);
+    return response;
+  }
+
+  // Either no Range was asked for, or this server refuses to honour it.
+  response.code = 200;
+  response.body = st->content;
+  return response;
+}
+}  // namespace
+
+
+TEST_F(T_Download, ResumeShortTransferWithRange) {
+  // The branch resumes a transfer that was cut after delivering data, instead
+  // of starting it again from byte zero.  Nothing covered this.
+  ResumeState st;
+  st.content = std::string(64 * 1024, 'q');
+  shash::Any content_hash(shash::kSha1);
+  shash::HashString(st.content, &content_hash);
+
+  MockHTTPServer server(8104);
+  ASSERT_TRUE(server.SetResponseCallback(ResumeHandler, &st));
+  ASSERT_TRUE(server.Start());
+  download_mgr.SetProxyChain("DIRECT", "", DownloadManager::kSetProxyBoth);
+  // Retries are off by default in a bare manager, and a resume is a retry.
+  download_mgr.SetRetryParameters(3, 0, 0);
+
+  // Resuming is only offered to sinks that do not pre-reserve their space, so
+  // a file sink rather than a memory one -- see Sink::RequiresReserve().
+  string dest_path;
+  FILE *fdest = CreateTemporaryFile(&dest_path);
+  ASSERT_TRUE(fdest != NULL);
+  cvmfs::FileSink filesink(fdest);
+
+  const string url = "http://127.0.0.1:8104/object";
+  JobInfo info(&url, false /* compressed */, false /* probe hosts */,
+               &content_hash, &filesink);
+  download_mgr.Fetch(&info);
+
+  EXPECT_EQ(kFailOk, info.error_code());
+  EXPECT_TRUE(st.saw_range) << "the retry did not ask for a byte range";
+  // The resume must start exactly where the first attempt stopped.
+  EXPECT_EQ(st.content.length() / 2, st.range_first_byte);
+  fclose(fdest);
+
+  const int fd_read = open(dest_path.c_str(), O_RDONLY);
+  ASSERT_GE(fd_read, 0);
+  string written;
+  EXPECT_TRUE(SafeReadToString(fd_read, &written));
+  close(fd_read);
+  EXPECT_EQ(st.content, written);
+  unlink(dest_path.c_str());
+  server.Stop();
+}
+
+
+TEST_F(T_Download, ResumeRestartsWhenServerIgnoresRange) {
+  // A server that answers a Range request with a plain 200 would otherwise
+  // have its full body appended behind the bytes already kept, silently
+  // corrupting the object.  The client must notice and start over.
+  ResumeState st;
+  st.content = std::string(64 * 1024, 'z');
+  st.honour_range = false;
+  shash::Any content_hash(shash::kSha1);
+  shash::HashString(st.content, &content_hash);
+
+  MockHTTPServer server(8105);
+  ASSERT_TRUE(server.SetResponseCallback(ResumeHandler, &st));
+  ASSERT_TRUE(server.Start());
+  download_mgr.SetProxyChain("DIRECT", "", DownloadManager::kSetProxyBoth);
+  download_mgr.SetRetryParameters(3, 0, 0);
+
+  string dest_path;
+  FILE *fdest = CreateTemporaryFile(&dest_path);
+  ASSERT_TRUE(fdest != NULL);
+  cvmfs::FileSink filesink(fdest);
+
+  const string url = "http://127.0.0.1:8105/object";
+  JobInfo info(&url, false /* compressed */, false /* probe hosts */,
+               &content_hash, &filesink);
+  download_mgr.Fetch(&info);
+  fclose(fdest);
+
+  // Whatever the outcome, what lands on disk must never be the full body
+  // appended behind the half already kept.
+  const int fd_read = open(dest_path.c_str(), O_RDONLY);
+  ASSERT_GE(fd_read, 0);
+  string written;
+  EXPECT_TRUE(SafeReadToString(fd_read, &written));
+  close(fd_read);
+  EXPECT_LE(written.length(), st.content.length());
+  if (info.error_code() == kFailOk) {
+    EXPECT_EQ(st.content, written);
+  }
+  unlink(dest_path.c_str());
+  server.Stop();
+}
+
+
+TEST_F(T_Download, ContentLengthIsRecorded) {
+  ResumeState st;
+  st.content = std::string(4096, 'c');
+  MockHTTPServer server(8106);
+  ASSERT_TRUE(server.SetResponseCallback(ResumeHandler, &st));
+  ASSERT_TRUE(server.Start());
+  download_mgr.SetProxyChain("DIRECT", "", DownloadManager::kSetProxyBoth);
+
+  // Skip the deliberately-short first reply.
+  st.requests = 1;
+  const string url = "http://127.0.0.1:8106/object";
+  cvmfs::MemSink sink;
+  JobInfo info(&url, false, false, NULL, &sink);
+  download_mgr.Fetch(&info);
+
+  EXPECT_EQ(kFailOk, info.error_code());
+  EXPECT_EQ(static_cast<int64_t>(st.content.length()), info.content_length());
+  server.Stop();
+}
+
+
+TEST_F(T_Download, IgnoredRangeEndsTheFreeRetries) {
+  // A peer that delivers a few KiB, cuts the stream, and answers every Range
+  // with a plain 200 used to be retried for ever: each cut attempt made
+  // "progress", the budget was refreshed, and the restart began again.  Once
+  // the Range is ignored, resuming is switched off for the object and the
+  // ordinary, finite budget applies.
+  ResumeState st;
+  st.content = std::string(96 * 1024, 'x');
+  st.cut_responses = 1000;   // cut every reply
+  st.honour_range = false;
+  shash::Any content_hash(shash::kSha1);
+  shash::HashString(st.content, &content_hash);
+
+  MockHTTPServer server(8129);
+  ASSERT_TRUE(server.SetResponseCallback(ResumeHandler, &st));
+  ASSERT_TRUE(server.Start());
+  download_mgr.SetProxyChain("DIRECT", "", DownloadManager::kSetProxyBoth);
+  download_mgr.SetRetryParameters(2, 0, 0);
+  download_mgr.SetTimeout(0, 0);
+
+  string dest_path;
+  FILE *fdest = CreateTemporaryFile(&dest_path);
+  ASSERT_TRUE(fdest != NULL);
+  cvmfs::FileSink filesink(fdest);
+
+  const string url = "http://127.0.0.1:8129/object";
+  JobInfo info(&url, false, false, &content_hash, &filesink);
+  download_mgr.Fetch(&info);
+  fclose(fdest);
+  unlink(dest_path.c_str());
+  server.Stop();
+
+  EXPECT_NE(kFailOk, info.error_code());
+  EXPECT_TRUE(st.saw_range) << "a resume was never attempted";
+  EXPECT_TRUE(info.resume_disabled());
+  // Attempt, resume (ignored), then at most the configured retries.
+  EXPECT_LE(st.requests, 8) << "unbounded retry storm";
+}
+
+
+TEST_F(T_Download, CutStreamsWithProgressAreStillBounded) {
+  // The other half: a peer that honours Range but cuts every reply after
+  // delivering something.  Each attempt makes progress, so none of them
+  // consumes the retry budget.  Progress accumulates, so this converges on
+  // its own; the test is a sanity check on the request count, not the
+  // discriminator for the livelock (that is IgnoredRangeEndsTheFreeRetries).
+  // kMaxFreeRetries is defence in depth for a peer that lies about ranges.
+  ResumeState st;
+  st.content = std::string(96 * 1024, 'y');
+  st.cut_responses = 1000;
+  shash::Any content_hash(shash::kSha1);
+  shash::HashString(st.content, &content_hash);
+
+  MockHTTPServer server(8131);
+  ASSERT_TRUE(server.SetResponseCallback(ResumeHandler, &st));
+  ASSERT_TRUE(server.Start());
+  download_mgr.SetProxyChain("DIRECT", "", DownloadManager::kSetProxyBoth);
+  download_mgr.SetRetryParameters(2, 0, 0);
+  download_mgr.SetTimeout(0, 0);
+
+  string dest_path;
+  FILE *fdest = CreateTemporaryFile(&dest_path);
+  ASSERT_TRUE(fdest != NULL);
+  cvmfs::FileSink filesink(fdest);
+
+  const string url = "http://127.0.0.1:8131/object";
+  JobInfo info(&url, false, false, &content_hash, &filesink);
+  download_mgr.Fetch(&info);
+  fclose(fdest);
+  unlink(dest_path.c_str());
+  server.Stop();
+
+  // Halving what is left on every attempt, 96 KiB is finished within the
+  // free-retry allowance -- but a peer that always cuts is the point here,
+  // so what matters is that the count of requests is bounded either way.
+  EXPECT_TRUE(st.saw_range);
+  EXPECT_LE(st.requests, 32 + 2 + 2) << "free retries are not bounded";
+}
+
+
+TEST_F(T_Download, ProgressRefreshesTheRetryBudget) {
+  // The branch lets an attempt that actually delivered bytes off the retry
+  // budget (kMinResumeProgress), so a large object can still finish on a link
+  // that keeps cutting long transfers.  With a budget of one retry and two
+  // cut responses, the object only completes if that rule holds.
+  ResumeState st;
+  st.content = std::string(96 * 1024, 'p');
+  st.cut_responses = 2;
+  shash::Any content_hash(shash::kSha1);
+  shash::HashString(st.content, &content_hash);
+
+  MockHTTPServer server(8107);
+  ASSERT_TRUE(server.SetResponseCallback(ResumeHandler, &st));
+  ASSERT_TRUE(server.Start());
+  download_mgr.SetProxyChain("DIRECT", "", DownloadManager::kSetProxyBoth);
+  download_mgr.SetRetryParameters(1, 0, 0);  // a single retry on its own
+  // CanRetry() also grants cheap retries while the attempts without progress
+  // have not cost one timeout period.  A zero timeout empties that budget, so
+  // the third request below can only come from the progress rule.
+  download_mgr.SetTimeout(0, 0);
+
+  string dest_path;
+  FILE *fdest = CreateTemporaryFile(&dest_path);
+  ASSERT_TRUE(fdest != NULL);
+  cvmfs::FileSink filesink(fdest);
+
+  const string url = "http://127.0.0.1:8107/object";
+  JobInfo info(&url, false, false, &content_hash, &filesink);
+  download_mgr.Fetch(&info);
+  fclose(fdest);
+
+  EXPECT_EQ(kFailOk, info.error_code());
+  EXPECT_GE(st.requests, 3) << "budget was not refreshed by progress";
+  EXPECT_TRUE(st.saw_range) << "the retries did not resume";
+  // Progress does not consume the budget: nothing was counted as a retry.
+  EXPECT_EQ(0U, info.num_retries());
+  const int fd_read = open(dest_path.c_str(), O_RDONLY);
+  ASSERT_GE(fd_read, 0);
+  string written;
+  EXPECT_TRUE(SafeReadToString(fd_read, &written));
+  close(fd_read);
+  EXPECT_EQ(st.content, written);
+  unlink(dest_path.c_str());
+  server.Stop();
+}
+
+
 TEST_F(T_Download, Multiple) {
   string dest_path;
   FILE *fdest = CreateTemporaryFile(&dest_path);

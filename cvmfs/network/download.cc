@@ -111,6 +111,46 @@ bool Interrupted(const std::string &fqrn, JobInfo *info) {
   return false;
 }
 
+/**
+ * A short transfer is resumed rather than restarted if at least this many
+ * bytes arrived, and such a resume does not count against the retry budget.
+ */
+static const curl_off_t kMinResumeProgress = 8 * 1024;
+/** Upper bound on retries granted for free because the attempt progressed */
+static const unsigned kMaxFreeRetries = 32;
+
+
+/**
+ * Byte range of the request: the caller's range (external files) shifted by
+ * the bytes already received in earlier attempts of the same transfer.
+ */
+static void SetRangeOption(JobInfo *info, CURL *handle) {
+  const bool has_range = (info->range_offset() != -1) && (info->range_size());
+  if (!has_range && (info->resume_offset() == 0)) {
+    curl_easy_setopt(handle, CURLOPT_RANGE, NULL);
+    return;
+  }
+  const int64_t lower = (has_range ? static_cast<int64_t>(info->range_offset())
+                                   : 0)
+                        + static_cast<int64_t>(info->resume_offset());
+  char byte_range_array[100];
+  int len;
+  if (has_range) {
+    const int64_t upper = static_cast<int64_t>(info->range_offset()
+                                               + info->range_size() - 1);
+    len = snprintf(byte_range_array, sizeof(byte_range_array),
+                   "%" PRId64 "-%" PRId64, lower, upper);
+  } else {
+    len = snprintf(byte_range_array, sizeof(byte_range_array), "%" PRId64 "-",
+                   lower);
+  }
+  if (len >= static_cast<int>(sizeof(byte_range_array))) {
+    PANIC(NULL);  // Should be impossible given limits on offset size.
+  }
+  curl_easy_setopt(handle, CURLOPT_RANGE, byte_range_array);
+}
+
+
 static Failures PrepareDownloadDestination(JobInfo *info) {
   if (info->sink() != NULL && !info->sink()->IsValid()) {
     cvmfs::PathSink *psink = dynamic_cast<cvmfs::PathSink *>(info->sink());
@@ -129,6 +169,35 @@ static Failures PrepareDownloadDestination(JobInfo *info) {
   }
 
   return kFailOk;
+}
+
+
+/**
+ * True when the TCP connect for this transfer completed, whatever happened
+ * afterwards.  It tells a peer that never answered apart from one that
+ * answered and then misbehaved.
+ *
+ * CURLINFO_CONNECT_TIME_T arrived in libcurl 7.61.0 but the build accepts
+ * 7.55.0 (see externals/libcurl/CMakeLists.txt), so fall back to the
+ * double-valued CURLINFO_CONNECT_TIME, which carries the same meaning at
+ * lower resolution.
+ */
+static bool ConnectCompleted(CURL *handle) {
+#if LIBCURL_VERSION_NUM >= 0x073d00  // 7.61.0
+  curl_off_t connect_time = 0;
+  if (curl_easy_getinfo(handle, CURLINFO_CONNECT_TIME_T, &connect_time)
+      != CURLE_OK) {
+    return false;
+  }
+  return connect_time > 0;
+#else
+  double connect_time = 0.0;
+  if (curl_easy_getinfo(handle, CURLINFO_CONNECT_TIME, &connect_time)
+      != CURLE_OK) {
+    return false;
+  }
+  return connect_time > 0.0;
+#endif
 }
 
 
@@ -160,6 +229,19 @@ static size_t CallbackCurlHeader(void *ptr, size_t size, size_t nmemb,
     }
 
     if ((info->http_code() / 100) == 2) {
+      if ((info->resume_offset() > 0) && (info->http_code() != 206)) {
+        // Resuming, but the server ignored the Range header.  Abort before
+        // any body byte is delivered and let the retry start from scratch.
+        LogCvmfs(kLogDownload, kLogDebug,
+                 "(id %" PRId64 ") server ignored resume range, restarting",
+                 info->id());
+        info->SetResumeOffset(0);
+        info->SetResumeDisabled(true);
+        info->SetErrorCode((info->proxy() == "DIRECT")
+                               ? kFailHostShortTransfer
+                               : kFailProxyShortTransfer);
+        return 0;
+      }
       return num_bytes;
     } else if ((info->http_code() == 301) || (info->http_code() == 302)
                || (info->http_code() == 303) || (info->http_code() == 307)) {
@@ -196,12 +278,14 @@ static size_t CallbackCurlHeader(void *ptr, size_t size, size_t nmemb,
   }
 
   // If needed: allocate space in sink
-  if (info->sink() != NULL && info->sink()->RequiresReserve()
-      && HasPrefix(header_line, "CONTENT-LENGTH:", true)) {
+  if (HasPrefix(header_line, "CONTENT-LENGTH:", true)) {
     char *tmp = reinterpret_cast<char *>(alloca(num_bytes + 1));
     uint64_t length = 0;
     sscanf(header_line.c_str(), "%s %" PRIu64, tmp, &length);
-    if (length > 0) {
+    info->SetContentLength(static_cast<int64_t>(length));
+    if (info->sink() == NULL || !info->sink()->RequiresReserve()) {
+      // nothing to reserve
+    } else if (length > 0) {
       if (!info->sink()->Reserve(length)) {
         LogCvmfs(kLogDownload, kLogDebug | kLogSyslogErr,
                  "(id %" PRId64 ") "
@@ -913,6 +997,12 @@ CURL *DownloadManager::AcquireCurlHandle() {
     curl_easy_setopt(handle, CURLOPT_NOSIGNAL, 1);
     // curl_easy_setopt(curl_default, CURLOPT_FAILONERROR, 1);
     curl_easy_setopt(handle, CURLOPT_HEADERFUNCTION, CallbackCurlHeader);
+    // For https:// through a proxy, libcurl would otherwise hand the proxy's
+    // "HTTP/1.1 200 Connection established" CONNECT reply to the header
+    // callback ahead of the origin's status line, where it reads as "the
+    // server ignored the Range" on every resume.  Available since 7.54.0,
+    // inside the build's 7.55.0 floor.
+    curl_easy_setopt(handle, CURLOPT_SUPPRESS_CONNECT_HEADERS, 1L);
     curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, CallbackCurlData);
   } else {
     handle = *(pool_handles_idle_->begin());
@@ -990,20 +1080,13 @@ void DownloadManager::InitializeRequest(JobInfo *info, CURL *handle) {
     shash::Init(info->hash_context());
   }
 
-  if ((info->range_offset() != -1) && (info->range_size())) {
-    char byte_range_array[100];
-    const int64_t range_lower = static_cast<int64_t>(info->range_offset());
-    const int64_t range_upper = static_cast<int64_t>(info->range_offset()
-                                                     + info->range_size() - 1);
-    if (snprintf(byte_range_array, sizeof(byte_range_array),
-                 "%" PRId64 "-%" PRId64, range_lower, range_upper)
-        == 100) {
-      PANIC(NULL);  // Should be impossible given limits on offset size.
-    }
-    curl_easy_setopt(handle, CURLOPT_RANGE, byte_range_array);
-  } else {
-    curl_easy_setopt(handle, CURLOPT_RANGE, NULL);
-  }
+  // Fetcher hands the same thread-local JobInfo back for the next object, so
+  // every per-transfer resume field has to be cleared here.
+  info->SetResumeOffset(0);
+  info->SetContentLength(-1);
+  info->SetFreeRetries(0);
+  info->SetResumeDisabled(false);
+  SetRangeOption(info, handle);
 
   // Set curl parameters
   curl_easy_setopt(handle, CURLOPT_PRIVATE, static_cast<void *>(info));
@@ -1780,8 +1863,82 @@ bool DownloadManager::VerifyAndFinalize(const int curl_error, JobInfo *info) {
     // leave the bytes of this failed attempt in the tube to be decompressed
     // into the output. Defer the reset by enqueuing an ordered marker; the
     // caller discards this attempt's bytes when it pops it (see below).
+    // Resume instead of restart: the content hash covers the bytes on the
+    // wire, and hash context, zlib stream and sink all keep their state, so a
+    // transfer that was cut or stalled after delivering data can continue
+    // with a Range request from the first missing byte.
+    bool resume = false;
+    bool free_retry = false;
+    if (info->expected_hash() && (info->sink() != NULL)
+        && !info->sink()->RequiresReserve() && !info->nocache()
+        && !info->resume_disabled()
+        && (IsHostTransferError(info->error_code())
+            || IsProxyTransferError(info->error_code()))) {
+      // Bytes of this attempt count only if they came with a 2xx; an attempt
+      // that died before any body byte keeps the progress of earlier ones.
+      // The object is content-addressed, so the resume is valid on another
+      // host or proxy as well.
+      curl_off_t received = 0;
+      if ((info->http_code() / 100) == 2) {
+        curl_easy_getinfo(info->curl_handle(), CURLINFO_SIZE_DOWNLOAD_T,
+                          &received);
+      }
+      resume = (received > 0) || (info->resume_offset() > 0);
+      if ((info->resume_offset() > 0) && (received == 0)
+          && ConnectCompleted(info->curl_handle())) {
+        // The peer took the Range request and answered with nothing (a
+        // stall, a 416): it does not honour ranges for this object.  Start
+        // over from byte zero and do not ask again.  A connect that never
+        // completed says nothing about ranges, so it keeps the progress.
+        info->SetResumeDisabled(true);
+        resume = false;
+      }
+      if (received > 0) {
+        // Progress does not consume the retry budget -- otherwise a large
+        // object could never complete on a link that drops long flows -- but
+        // it is not unlimited either, or a peer that cuts every reply after
+        // a few KiB would be retried forever.
+        free_retry = (received >= kMinResumeProgress)
+                     && (info->free_retries() < kMaxFreeRetries);
+        if (free_retry) {
+          info->SetFreeRetries(info->free_retries() + 1);
+          info->SetNoProgressSinceMs(0);
+        }
+        info->SetResumeOffset(info->resume_offset()
+                              + static_cast<uint64_t>(received));
+        if ((info->content_length() > 0)
+            && (info->resume_offset()
+                >= static_cast<uint64_t>(info->content_length()))) {
+          // Everything already arrived; the error was in the framing, not
+          // the data.  Nothing left to resume from -- restart.
+          info->SetResumeOffset(0);
+          resume = false;
+        }
+        LogCvmfs(kLogDownload, kLogDebug,
+                 "(manager '%s' - id %" PRId64 ") "
+                 "resuming %s at byte %" PRIu64,
+                 name_.c_str(), info->id(), info->url()->c_str(),
+                 info->resume_offset());
+      }
+    }
+    if (!resume) {
+      info->SetResumeOffset(0);
+    }
+    if (free_retry) {
+      // Not the exponential backoff, but not immediately either: a small
+      // jitter, so a cut stream is not hammered.
+      info->SetBackoffMs(10 + prng_.Next(90));
+      if (multi_threaded_.load() == 1) {
+        info->SetRetryNotBeforeMs(platform_monotonic_time_ns() / 1000000
+                                  + info->backoff_ms());
+      } else {
+        SafeSleepMs(info->backoff_ms());
+      }
+    }
+    SetRangeOption(info, info->curl_handle());
+
     const bool defer_reset = info->IsValidDataTube();
-    if (!defer_reset) {
+    if (!resume && !defer_reset) {
       if (info->sink() != NULL && info->sink()->Reset() != 0) {
         info->SetErrorCode(kFailLocalIO);
         goto verify_and_finalize_stop;
@@ -1795,13 +1952,13 @@ bool DownloadManager::VerifyAndFinalize(const int curl_error, JobInfo *info) {
     // The hash context is updated on this (MainDownload) thread in
     // CallbackCurlData(), so it is reset here regardless of the decompress
     // mode.
-    if (info->expected_hash()) {
+    if (!resume && info->expected_hash()) {
       shash::Init(info->hash_context());
     }
-    if (info->compressed() && !defer_reset) {
+    if (!resume && info->compressed() && !defer_reset) {
       zlib::DecompressInit(info->GetZstreamPtr());
     }
-    if (defer_reset) {
+    if (!resume && defer_reset) {
       info->GetDataTubePtr()->EnqueueBack(new DataTubeElement(kActionReset));
     }
 
@@ -1830,13 +1987,15 @@ bool DownloadManager::VerifyAndFinalize(const int curl_error, JobInfo *info) {
         default:
           if (IsProxyTransferError(info->error_code())) {
             if (same_url_retry) {
-              Backoff(info);
+              if (!free_retry)
+                Backoff(info);
             } else {
               switch_proxy = true;
             }
           } else if (IsHostTransferError(info->error_code())) {
             if (same_url_retry) {
-              Backoff(info);
+              if (!free_retry)
+                Backoff(info);
             } else {
               switch_host = true;
             }

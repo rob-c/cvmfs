@@ -65,6 +65,10 @@ void JobInfo::Init() {
   //
   range_offset_ = -1;
   range_size_ = -1;
+  resume_offset_ = 0;
+  content_length_ = -1;
+  free_retries_ = 0;
+  resume_disabled_ = false;
   //
   curl_handle_ = NULL;
   headers_ = NULL;
