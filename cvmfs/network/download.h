@@ -115,6 +115,14 @@ class CredentialsAttachment {
  * Note when adding new fields: Clone() probably needs to be adjusted, too.
  * TODO(jblomer): improve ordering of members
  */
+/**
+ * Exposed for unit tests: applies the socket options libcurl would set from
+ * inside a live connection attempt.
+ */
+int CallbackCurlSockoptForTest(void *clientp, curl_socket_t curlfd,
+                               curlsocktype purpose);
+
+
 class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
   FRIEND_TEST(T_Download, ValidateGeoReply);
   FRIEND_TEST(T_Download, StripDirect);
@@ -308,6 +316,7 @@ class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
   CURLM *curl_multi_;
   HeaderLists *header_lists_;
   curl_slist *default_headers_;
+  FRIEND_TEST(T_Download, SocketTeardownIsBounded);
   char *user_agent_;
 
   pthread_t thread_download_;

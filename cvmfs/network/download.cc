@@ -31,10 +31,13 @@
 #include <alloca.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
+#include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -838,6 +841,61 @@ string DownloadManager::ProxyInfo::Print() {
 
 
 /**
+ * Upper bound on how long data may stay unacknowledged before the kernel gives
+ * up on a connection, and how many keep-alive probes may go unanswered.
+ *
+ * Keep-alive only governs a connection that is *idle*.  As soon as anything is
+ * in flight -- a request, or the FIN that closes the connection -- the
+ * retransmit timer takes over, and that is bounded by net.ipv4.tcp_retries2,
+ * whose default of 15 works out at roughly a quarter of an hour.  So when a
+ * firewall swallows the peer's ACK or RST, the socket does not fail: it sits
+ * there retransmitting into the filtered path, stuck in LAST-ACK or holding a
+ * request that will never be answered, long after the peer has forgotten it.
+ *
+ * TCP_USER_TIMEOUT overrides tcp_retries2 for this socket, so an unacknowledged
+ * teardown, or an unanswered request, is abandoned in seconds rather than
+ * minutes.  It costs nothing on a healthy connection: while the peer keeps
+ * acknowledging, the timer never fires, so slow-but-alive transfers are not
+ * affected.  TCP_KEEPCNT bounds dead-peer detection in the same spirit;
+ * libcurl only gained an option for it in 8.9, so it is set directly here.
+ */
+static const unsigned kTcpUserTimeoutMs = 60000;
+static const int kTcpKeepaliveProbes = 3;
+
+
+/**
+ * Applied by libcurl to every socket it opens for a connection.
+ */
+static int CallbackCurlSockopt(void * /* clientp */,
+                               curl_socket_t curlfd,
+                               curlsocktype purpose) {
+  if (purpose != CURLSOCKTYPE_IPCXN)
+    return CURL_SOCKOPT_OK;
+#ifdef TCP_USER_TIMEOUT
+  const unsigned user_timeout_ms = kTcpUserTimeoutMs;
+  setsockopt(curlfd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout_ms,
+             sizeof(user_timeout_ms));
+#endif
+#ifdef TCP_KEEPCNT
+  const int keepalive_probes = kTcpKeepaliveProbes;
+  setsockopt(curlfd, IPPROTO_TCP, TCP_KEEPCNT, &keepalive_probes,
+             sizeof(keepalive_probes));
+#endif
+  return CURL_SOCKOPT_OK;
+}
+
+
+/**
+ * Thin wrapper so the unit tests can exercise the socket options that libcurl
+ * would otherwise only apply from inside a live connection attempt.
+ */
+int CallbackCurlSockoptForTest(void *clientp, curl_socket_t curlfd,
+                               curlsocktype purpose) {
+  return CallbackCurlSockopt(clientp, curlfd, purpose);
+}
+
+
+/**
  * Gets an idle CURL handle from the pool. Creates a new one and adds it to
  * the pool if necessary.
  */
@@ -853,6 +911,7 @@ CURL *DownloadManager::AcquireCurlHandle() {
     // curl_easy_setopt(curl_default, CURLOPT_FAILONERROR, 1);
     curl_easy_setopt(handle, CURLOPT_HEADERFUNCTION, CallbackCurlHeader);
     curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, CallbackCurlData);
+    curl_easy_setopt(handle, CURLOPT_SOCKOPTFUNCTION, CallbackCurlSockopt);
   } else {
     handle = *(pool_handles_idle_->begin());
     pool_handles_idle_->erase(pool_handles_idle_->begin());

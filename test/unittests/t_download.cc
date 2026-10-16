@@ -2,6 +2,9 @@
  * This file is part of the CernVM File System.
  */
 
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <cassert>
@@ -300,6 +303,80 @@ TEST_F(T_Download, LocalFile2Mem) {
   ASSERT_EQ(memsink.pos(), src_content.length());
   EXPECT_STREQ(reinterpret_cast<char *>(memsink.data()), src_content.c_str());
 }
+
+TEST_F(T_Download, SocketTeardownIsBounded) {
+  // Keep-alive only governs an idle connection.  Once anything is in flight --
+  // a request, or the FIN that closes the connection -- the retransmit timer
+  // takes over, bounded by net.ipv4.tcp_retries2, which defaults to about a
+  // quarter of an hour.  A firewall that swallows the peer's ACK or RST
+  // therefore leaves the socket retransmitting for minutes.  Every socket
+  // libcurl opens must carry an explicit bound instead.
+  CURL *handle = download_mgr.AcquireCurlHandle();
+  ASSERT_TRUE(handle != NULL);
+
+  const int fd = socket(AF_INET, SOCK_STREAM, 0);
+  ASSERT_GE(fd, 0);
+
+  // Defaults first: the kernel leaves TCP_USER_TIMEOUT unset (0 == use
+  // tcp_retries2) and keeps the system-wide probe count.  TCP_USER_TIMEOUT is
+  // Linux-specific and the production callback is guarded the same way, so
+  // this part of the test is skipped where the option does not exist.
+#ifdef TCP_USER_TIMEOUT
+  {
+    unsigned before_timeout = 1;
+    socklen_t len = sizeof(before_timeout);
+    ASSERT_EQ(0, getsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &before_timeout,
+                            &len));
+    EXPECT_EQ(0U, before_timeout);
+  }
+#endif
+
+  // The callback libcurl invokes for every connection socket.
+  ASSERT_EQ(CURL_SOCKOPT_OK,
+            download::CallbackCurlSockoptForTest(NULL, fd, CURLSOCKTYPE_IPCXN));
+
+#ifdef TCP_USER_TIMEOUT
+  {
+    unsigned user_timeout = 0;
+    socklen_t len = sizeof(user_timeout);
+    ASSERT_EQ(0, getsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout,
+                            &len));
+    EXPECT_GT(user_timeout, 0U);
+    // Well under the ~15 minutes tcp_retries2 would otherwise allow.
+    EXPECT_LE(user_timeout, 120000U);
+  }
+#endif
+
+#ifdef TCP_KEEPCNT
+  {
+    int keepcnt = 0;
+    socklen_t len = sizeof(keepcnt);
+    ASSERT_EQ(0, getsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, &len));
+    EXPECT_GT(keepcnt, 0);
+    EXPECT_LE(keepcnt, 5);
+  }
+#endif
+
+  // Sockets that are not connection sockets must be left alone.
+  const int fd2 = socket(AF_INET, SOCK_STREAM, 0);
+  ASSERT_GE(fd2, 0);
+  ASSERT_EQ(CURL_SOCKOPT_OK, download::CallbackCurlSockoptForTest(
+                                 NULL, fd2, CURLSOCKTYPE_ACCEPT));
+#ifdef TCP_USER_TIMEOUT
+  {
+    unsigned untouched = 1;
+    socklen_t len = sizeof(untouched);
+    ASSERT_EQ(0,
+              getsockopt(fd2, IPPROTO_TCP, TCP_USER_TIMEOUT, &untouched, &len));
+    EXPECT_EQ(0U, untouched);
+  }
+#endif
+
+  close(fd);
+  close(fd2);
+  download_mgr.ReleaseCurlHandle(handle, false /* allow_reuse */);
+}
+
 
 TEST_F(T_Download, RemoteFileSwitchHosts) {
   string src_path = GetSmallFile();
