@@ -955,6 +955,8 @@ void DownloadManager::InitializeRequest(JobInfo *info, CURL *handle) {
   if (opt_ipv4_only_) {
     curl_easy_setopt(handle, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
   }
+  // Handles are pooled; a previous retry may have requested a fresh connection
+  curl_easy_setopt(handle, CURLOPT_FRESH_CONNECT, 0L);
   if (follow_redirects_) {
     curl_easy_setopt(handle, CURLOPT_FOLLOWLOCATION, 1);
     curl_easy_setopt(handle, CURLOPT_MAXREDIRS, 4);
@@ -1772,6 +1774,13 @@ bool DownloadManager::VerifyAndFinalize(const int curl_error, JobInfo *info) {
         SetUrlOptions(info);
       }
     }  // end !sharding
+
+    // Never retry on a pooled keep-alive connection.  A middlebox (conntrack
+    // idle timeout, DPI black hole) silently kills idle flows without a FIN or
+    // RST, so curl cannot tell that the pooled connections are dead; retrying
+    // on one of them burns another full timeout and then wrongly fails over
+    // away from a healthy proxy or host.
+    curl_easy_setopt(info->curl_handle(), CURLOPT_FRESH_CONNECT, 1L);
 
     if (failover_indefinitely_) {
       // try again, breaking if there's a cvmfs reload happening and we are in a
