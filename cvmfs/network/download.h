@@ -193,6 +193,7 @@ class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
   void SetTimeout(const unsigned seconds_proxy, const unsigned seconds_direct);
   void GetTimeout(unsigned *seconds_proxy, unsigned *seconds_direct);
   void SetLowSpeedLimit(const unsigned low_speed_limit);
+  void SetTcpKeepalive(const unsigned idle_seconds);
   void SetMetalinkChain(const std::string &metalink_list);
   void SetMetalinkChain(const std::vector<std::string> &metalink_list);
   void GetMetalinkInfo(std::vector<std::string> *metalink_chain,
@@ -327,6 +328,10 @@ class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
   unsigned opt_timeout_proxy_;
   unsigned opt_timeout_direct_;
   unsigned opt_low_speed_limit_;
+  /** TCP keep-alive probe interval in seconds, 0 disables keep-alive */
+  unsigned opt_tcp_keepalive_;
+  FRIEND_TEST(T_Download, TcpKeepaliveOnByDefault);
+  FRIEND_TEST(T_Download, TcpKeepaliveSurvivesClone);
   unsigned opt_max_retries_;
   unsigned opt_backoff_init_ms_;
   unsigned opt_backoff_max_ms_;

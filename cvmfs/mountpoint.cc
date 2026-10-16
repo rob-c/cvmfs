@@ -2353,6 +2353,9 @@ void MountPoint::SetupHttpTuning() {
 
   if (options_mgr_->GetValue("CVMFS_LOW_SPEED_LIMIT", &optarg))
     download_mgr_->SetLowSpeedLimit(String2Uint64(optarg));
+  // Idle-connection probe interval in seconds; an explicit 0 disables it
+  if (options_mgr_->GetValue("CVMFS_TCP_KEEPALIVE", &optarg))
+    download_mgr_->SetTcpKeepalive(String2Uint64(optarg));
   if (options_mgr_->GetValue("CVMFS_PROXY_RESET_AFTER", &optarg)) {
     download_mgr_->SetProxyGroupResetDelay(String2Uint64(optarg));
     // Use the proxy reset delay as the default for the metalink reset delay

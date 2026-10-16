@@ -319,6 +319,42 @@ TEST_F(T_Download, RemoteFileSwitchHosts) {
   EXPECT_STREQ(reinterpret_cast<char *>(memsink.data()), src_content.c_str());
 }
 
+TEST_F(T_Download, TcpKeepaliveOnByDefault) {
+  // Keep-alive probes are what keep an idle flow on the books of a conntrack
+  // or DPI middlebox.  Without them the middlebox forgets the flow, the peer's
+  // FIN/RST stops matching an established connection and gets filtered by a
+  // RELATED,ESTABLISHED-only firewall, and the client is left holding a dead
+  // socket that costs it a whole request timeout to discover.
+  EXPECT_GT(download_mgr.opt_tcp_keepalive_, 0U);
+
+  // An explicit setting still wins, including switching the probes off.
+  download_mgr.SetTcpKeepalive(90);
+  EXPECT_EQ(90U, download_mgr.opt_tcp_keepalive_);
+  download_mgr.SetTcpKeepalive(0);
+  EXPECT_EQ(0U, download_mgr.opt_tcp_keepalive_);
+
+  // A clone inherits the setting rather than silently reverting to the default.
+  download_mgr.SetTcpKeepalive(45);
+  perf::Statistics stats;
+  DownloadManager *clone = download_mgr.Clone(
+      perf::StatisticsTemplate("clone", &stats), "clone");
+  EXPECT_EQ(45U, clone->opt_tcp_keepalive_);
+  delete clone;
+}
+
+
+TEST_F(T_Download, TcpKeepaliveSurvivesClone) {
+  // The external download manager is created as a clone, so a setting that
+  // does not propagate would apply to catalogs but not to external data.
+  download_mgr.SetTcpKeepalive(45);
+  perf::Statistics stats;
+  DownloadManager *clone = download_mgr.Clone(
+      perf::StatisticsTemplate("clone", &stats), "clone");
+  EXPECT_EQ(45U, clone->opt_tcp_keepalive_);
+  delete clone;
+}
+
+
 TEST_F(T_Download, CancelRequest) {
   string src_path = GetSmallFile();
   string src_content = GetFileContents(src_path);

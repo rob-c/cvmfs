@@ -879,6 +879,22 @@ void DownloadManager::ReleaseCurlHandle(CURL *handle, bool allow_reuse) {
 
 
 /**
+ * Idle time after which an established connection starts emitting TCP
+ * keep-alive probes.
+ *
+ * A stateful middlebox -- conntrack, NAT, a DPI box -- drops its record of a
+ * flow that has been quiet for a while.  Once that record is gone, the peer's
+ * eventual FIN or RST no longer matches an established connection, so a
+ * firewall that only admits RELATED,ESTABLISHED discards the teardown packet.
+ * The client is then left holding a socket that is dead but looks open, and
+ * only finds out by spending a whole request timeout on it -- which in turn
+ * burns the proxy and fails over away from a perfectly healthy one.  Probing
+ * well inside the usual idle budgets keeps the flow on the books.
+ */
+static const unsigned kDefaultTcpKeepaliveSecs = 30;
+
+
+/**
  * HTTP request options: set the URL and other options such as timeout and
  * proxy.
  */
@@ -1063,6 +1079,17 @@ void DownloadManager::SetUrlOptions(JobInfo *info) {
   CheckHostInfoReset("host", opt_host_, info, now);
 
   curl_easy_setopt(curl_handle, CURLOPT_LOW_SPEED_LIMIT, opt_low_speed_limit_);
+  if (opt_tcp_keepalive_ > 0) {
+    // Keep idle keep-alive connections visible to stateful middleboxes
+    // (NAT/conntrack/DPI) that silently drop flows after an idle period
+    curl_easy_setopt(curl_handle, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(curl_handle, CURLOPT_TCP_KEEPIDLE,
+                     static_cast<long>(opt_tcp_keepalive_));  // NOLINT
+    curl_easy_setopt(curl_handle, CURLOPT_TCP_KEEPINTVL,
+                     static_cast<long>(opt_tcp_keepalive_));  // NOLINT
+  } else {
+    curl_easy_setopt(curl_handle, CURLOPT_TCP_KEEPALIVE, 0L);
+  }
   if (info->proxy() != "DIRECT") {
     curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT, opt_timeout_proxy_);
     curl_easy_setopt(curl_handle, CURLOPT_LOW_SPEED_TIME, opt_timeout_proxy_);
@@ -1899,6 +1926,7 @@ DownloadManager::DownloadManager(const unsigned max_pool_handles,
     , opt_timeout_proxy_(5)
     , opt_timeout_direct_(10)
     , opt_low_speed_limit_(1024)
+    , opt_tcp_keepalive_(kDefaultTcpKeepaliveSecs)
     , opt_max_retries_(0)
     , opt_backoff_init_ms_(0)
     , opt_backoff_max_ms_(0)
@@ -2261,6 +2289,11 @@ void DownloadManager::SetTimeout(const unsigned seconds_proxy,
 void DownloadManager::SetLowSpeedLimit(const unsigned low_speed_limit) {
   const MutexLockGuard m(lock_options_);
   opt_low_speed_limit_ = low_speed_limit;
+}
+
+void DownloadManager::SetTcpKeepalive(const unsigned idle_seconds) {
+  const MutexLockGuard m(lock_options_);
+  opt_tcp_keepalive_ = idle_seconds;
 }
 
 
@@ -3300,6 +3333,7 @@ DownloadManager *DownloadManager::Clone(
   clone->opt_timeout_proxy_ = opt_timeout_proxy_;
   clone->opt_timeout_direct_ = opt_timeout_direct_;
   clone->opt_low_speed_limit_ = opt_low_speed_limit_;
+  clone->opt_tcp_keepalive_ = opt_tcp_keepalive_;
   clone->opt_max_retries_ = opt_max_retries_;
   clone->opt_backoff_init_ms_ = opt_backoff_init_ms_;
   clone->opt_backoff_max_ms_ = opt_backoff_max_ms_;
