@@ -1032,6 +1032,13 @@ void FileSystem::SetupSqlite() {
   assert(retval == SQLITE_OK);
   retval = sqlite3_config(SQLITE_CONFIG_MULTITHREAD);
   assert(retval == SQLITE_OK);
+  // SQLite serialises calls into a custom allocator (SqliteMemoryManager has
+  // no lock of its own) only while memory statistics are enabled.  That is
+  // the compile-time default for the bundled SQLite but not for every system
+  // library (macOS ships SQLITE_DEFAULT_MEMSTATUS=0), where concurrent catalog
+  // lookups then corrupt the allocator's arena.
+  retval = sqlite3_config(SQLITE_CONFIG_MEMSTATUS, 1);
+  assert(retval == SQLITE_OK);
   SqliteMemoryManager::GetInstance()->AssignGlobalArenas();
 
   // Disable SQlite3 file locking
