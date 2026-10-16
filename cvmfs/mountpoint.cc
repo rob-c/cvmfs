@@ -47,7 +47,6 @@
 #include "file_chunk.h"
 #include "globals.h"
 #include "glue_buffer.h"
-#include "google/protobuf/stubs/common.h"
 #include "history.h"
 #include "history_sqlite.h"
 #include "lru_md.h"
@@ -496,7 +495,15 @@ FileSystem::~FileSystem() {
   SetLogSyslogPrefix("");
   SetLogMicroSyslog("");
   SetLogDebugFile("");
-  google::protobuf::ShutdownProtobufLibrary();
+  // Deliberately no google::protobuf::ShutdownProtobufLibrary() here.  It is
+  // process-global and irreversible: it frees protobuf's shutdown registry
+  // and destroys its static defaults, and protobuf documents that nothing in
+  // the library may be used afterwards.  A FileSystem is not tied to the
+  // process lifetime, though: cvmfs.cc recreates one when it waits for the
+  // workspace lock, libcvmfs attaches and detaches repeatedly, and the unit
+  // tests build one per case.  The next external cache manager then runs
+  // protobuf on freed memory.  Skipping the call only leaks a few static
+  // objects at process exit.
   g_alive = false;
 }
 

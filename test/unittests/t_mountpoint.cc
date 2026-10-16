@@ -3,6 +3,7 @@
  */
 
 #include <fcntl.h>
+#include <google/protobuf/message_lite.h>
 #include <gtest/gtest.h>
 #include <sys/param.h>
 #include <sys/wait.h>
@@ -85,6 +86,27 @@ TEST_F(T_MountPoint, CreateBasic) {
   ASSERT_TRUE(file_system != NULL);
   EXPECT_TRUE(file_system->IsValid());
   delete file_system;
+}
+
+
+namespace {
+bool g_protobuf_was_shut_down = false;
+void NoteProtobufShutdown() { g_protobuf_was_shut_down = true; }
+}  // anonymous namespace
+
+TEST_F(T_MountPoint, TeardownKeepsProtobufUsable) {
+  // ShutdownProtobufLibrary() is process-global, and protobuf documents that
+  // nothing in the library may be used after it.  A FileSystem is destroyed
+  // and created again routinely (workspace-lock retry, libcvmfs re-attach,
+  // these tests) and the next one's external cache manager speaks protobuf,
+  // so destroying a FileSystem must not shut protobuf down.  OnShutdown() is
+  // protobuf's own notification that a shutdown happened.
+  google::protobuf::internal::OnShutdown(NoteProtobufShutdown);
+  FileSystem *file_system = FileSystem::Create(fs_info_);
+  ASSERT_TRUE(file_system != NULL);
+  delete file_system;
+  EXPECT_FALSE(g_protobuf_was_shut_down)
+      << "~FileSystem() shut the protobuf library down";
 }
 
 
