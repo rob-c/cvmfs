@@ -557,6 +557,9 @@ void *DownloadManager::MainDownload(void *data) {
   int still_running = 0;
   struct timeval timeval_start, timeval_stop;
   gettimeofday(&timeval_start, NULL);
+  // Retries waiting for their backoff to expire (see Backoff())
+  std::vector<JobInfo *> deferred;
+
   while (true) {
     int timeout;
     if (still_running) {
@@ -576,6 +579,25 @@ void *DownloadManager::MainDownload(void *data) {
       const int64_t delta = static_cast<int64_t>(
           1000 * DiffTimeSeconds(timeval_start, timeval_stop));
       perf::Xadd(download_mgr->counters_->sz_transfer_time, delta);
+      // Deferred-retry wake-ups come back through here while still idle;
+      // count the interval once.
+      timeval_start = timeval_stop;
+    }
+    // Retries waiting out their backoff must not be slept through here: this
+    // is the single I/O thread for every transfer of this manager.  Instead
+    // the poll() below is shortened to the earliest moment at which one of
+    // them becomes due, so the thread keeps serving other transfers and wakes
+    // exactly when there is something to re-issue.
+    if (!deferred.empty()) {
+      const uint64_t now_ms = platform_monotonic_time_ns() / 1000000;
+      uint64_t next_ms = deferred[0]->retry_not_before_ms();
+      for (unsigned i = 1; i < deferred.size(); ++i)
+        next_ms = std::min(next_ms, deferred[i]->retry_not_before_ms());
+      const int wait_ms = (next_ms > now_ms)
+                              ? static_cast<int>(next_ms - now_ms)
+                              : 0;
+      if ((timeout < 0) || (wait_ms < timeout))
+        timeout = wait_ms;
     }
     const int retval = poll(download_mgr->watch_fds_,
                             download_mgr->watch_fds_inuse_, timeout);
@@ -592,6 +614,27 @@ void *DownloadManager::MainDownload(void *data) {
     // Terminate I/O thread
     if (download_mgr->watch_fds_[kIdxPipeTerminate].revents)
       break;
+
+    // Re-issue retries whose backoff has expired.  This has to stay below
+    // the termination check: a job taken out of `deferred` and handed to
+    // curl_multi_ is no longer covered by the shutdown cleanup after this
+    // loop, so its caller would wait for a result that never comes.
+    if (!deferred.empty()) {
+      const uint64_t now_ms = platform_monotonic_time_ns() / 1000000;
+      for (unsigned i = 0; i < deferred.size();) {
+        if (deferred[i]->retry_not_before_ms() <= now_ms) {
+          JobInfo *info = deferred[i];
+          info->SetRetryNotBeforeMs(0);
+          deferred.erase(deferred.begin() + i);
+          curl_multi_add_handle(download_mgr->curl_multi_,
+                                info->curl_handle());
+          curl_multi_socket_action(download_mgr->curl_multi_,
+                                   CURL_SOCKET_TIMEOUT, 0, &still_running);
+        } else {
+          ++i;
+        }
+      }
+    }
 
     // New job arrives
     if (download_mgr->watch_fds_[kIdxPipeJobs].revents) {
@@ -658,11 +701,18 @@ void *DownloadManager::MainDownload(void *data) {
 
         curl_multi_remove_handle(download_mgr->curl_multi_, easy_handle);
         if (download_mgr->VerifyAndFinalize(curl_error, info)) {
-          curl_multi_add_handle(download_mgr->curl_multi_, easy_handle);
-          curl_multi_socket_action(download_mgr->curl_multi_,
-                                   CURL_SOCKET_TIMEOUT,
-                                   0,
-                                   &still_running);
+          // Backoff() marked this retry as not-before a given time rather
+          // than sleeping.  Park it until then; its easy handle stays out of
+          // the multi stack meanwhile and is re-added above when due.
+          if (info->retry_not_before_ms() > 0) {
+            deferred.push_back(info);
+          } else {
+            curl_multi_add_handle(download_mgr->curl_multi_, easy_handle);
+            curl_multi_socket_action(download_mgr->curl_multi_,
+                                     CURL_SOCKET_TIMEOUT,
+                                     0,
+                                     &still_running);
+          }
         } else {
           // Return easy handle into pool and write result back
           download_mgr->ReleaseCurlHandle(easy_handle, true /* allow_reuse */);
@@ -675,6 +725,17 @@ void *DownloadManager::MainDownload(void *data) {
       }
     }
   }
+
+  // The thread is terminating, so retries still waiting out their backoff will
+  // never be re-issued.  Fail them explicitly rather than leaving their callers
+  // blocked forever on a result that is no longer coming.
+  for (unsigned i = 0; i < deferred.size(); ++i) {
+    JobInfo *info = deferred[i];
+    info->SetErrorCode(kFailOther);
+    info->GetDataTubePtr()->EnqueueBack(new DataTubeElement(kActionStop));
+    info->GetPipeJobResultPtr()->Write<download::Failures>(info->error_code());
+  }
+  deferred.clear();
 
   for (set<CURL *>::iterator i = download_mgr->pool_handles_inuse_->begin(),
                              iEnd = download_mgr->pool_handles_inuse_->end();
@@ -893,6 +954,7 @@ void DownloadManager::InitializeRequest(JobInfo *info, CURL *handle) {
   info->SetNumUsedHosts(1);
   info->SetNumRetries(0);
   info->SetBackoffMs(0);
+  info->SetRetryNotBeforeMs(0);
   info->SetHeaders(header_lists_->DuplicateList(default_headers_));
   if (info->info_header()) {
     header_lists_->AppendHeader(info->headers(), info->info_header());
@@ -1314,7 +1376,14 @@ void DownloadManager::Backoff(JobInfo *info) {
   LogCvmfs(kLogDownload, kLogDebug,
            "(manager '%s' - id %" PRId64 ") backing off for %d ms",
            name_.c_str(), info->id(), info->backoff_ms());
-  SafeSleepMs(info->backoff_ms());
+  if (multi_threaded_.load() == 1) {
+    // Sleeping here would stall the I/O thread and with it every other
+    // transfer of this manager; MainDownload re-queues the job when due.
+    info->SetRetryNotBeforeMs(platform_monotonic_time_ns() / 1000000
+                              + info->backoff_ms());
+  } else {
+    SafeSleepMs(info->backoff_ms());
+  }
 }
 
 void DownloadManager::SetNocache(JobInfo *info) {
