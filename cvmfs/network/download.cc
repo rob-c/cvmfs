@@ -892,6 +892,7 @@ void DownloadManager::InitializeRequest(JobInfo *info, CURL *handle) {
   info->SetNumUsedMetalinks(1);
   info->SetNumUsedHosts(1);
   info->SetNumRetries(0);
+  info->SetNoProgressSinceMs(0);
   info->SetBackoffMs(0);
   info->SetHeaders(header_lists_->DuplicateList(default_headers_));
   if (info->info_header()) {
@@ -1279,9 +1280,27 @@ bool DownloadManager::CanRetry(const JobInfo *info) {
   const MutexLockGuard m(lock_options_);
   const unsigned max_retries = opt_max_retries_;
 
-  return !(info->nocache()) && (info->num_retries() < max_retries)
-         && (IsProxyTransferError(info->error_code())
-             || IsHostTransferError(info->error_code()));
+  const bool retryable_error = IsProxyTransferError(info->error_code())
+                               || IsHostTransferError(info->error_code());
+  if (info->nocache() || !retryable_error)
+    return false;
+  if (max_retries == 0)
+    return false;
+  if (info->num_retries() < max_retries)
+    return true;
+  // Beyond the retry count, keep retrying failures that are cheap: as long
+  // as the attempts without progress have not yet cost one timeout period in
+  // total, the peer is answering quickly (severed streams, a refused connect)
+  // and another attempt is worth it.  A dead peer times out on each attempt
+  // and therefore still exhausts the budget after max_retries attempts.
+  if (info->no_progress_since_ms() > 0) {
+    const uint64_t now_ms = platform_monotonic_time_ns() / 1000000;
+    const uint64_t budget_ms = 1000ULL * ((info->proxy() == "DIRECT")
+                                              ? opt_timeout_direct_
+                                              : opt_timeout_proxy_);
+    return (now_ms - info->no_progress_since_ms()) < budget_ms;
+  }
+  return false;
 }
 
 /**
@@ -1683,6 +1702,9 @@ bool DownloadManager::VerifyAndFinalize(const int curl_error, JobInfo *info) {
              "error code %d%s",
              name_.c_str(), info->id(), same_url_retry ? "same url, " : "",
              info->error_code(), info->nocache() ? ", no cache" : "");
+    // Start the clock for CanRetry()'s budget of cheap retries
+    if (info->no_progress_since_ms() == 0)
+      info->SetNoProgressSinceMs(platform_monotonic_time_ns() / 1000000);
     // Reset internal state and destination. In parallel-decompress mode the
     // sink and zstream are owned by the caller thread (it pops and decompresses
     // the queued chunks). Resetting them here would race the caller and, worse,

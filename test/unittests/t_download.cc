@@ -262,6 +262,35 @@ TEST_F(T_Download, RemoteFileSimpleProxy) {
   EXPECT_STREQ(reinterpret_cast<char *>(memsink.data()), src_content.c_str());
 }
 
+TEST_F(T_Download, RefusedConnectGetsExtraCheapRetries) {
+  // A refused connection returns at once, so CanRetry()'s extended budget --
+  // "keep retrying while the attempts without progress have not yet cost one
+  // timeout period" -- should grant several attempts beyond max_retries before
+  // the proxy is written off.  A dead peer that times out on each attempt
+  // consumes that budget immediately instead.
+  //
+  // Nothing listens on 8115, and the kernel refuses instantly.  Measured with
+  // these parameters: 3 attempts spread over ~7.7s.  With backoff disabled the
+  // same budget allows ~163 attempts inside one 3s period, which is what makes
+  // the rule "cheap failures are worth repeating" rather than a fixed count.
+  download_mgr.SetProxyChain("http://127.0.0.1:8115", "",
+                             DownloadManager::kSetProxyBoth);
+  download_mgr.SetRetryParameters(1, 2000, 10000);  // stock-like backoff
+  download_mgr.SetTimeout(5, 5);
+
+  const string url = "http://127.0.0.1:8116/object";
+  cvmfs::MemSink sink;
+  JobInfo info(&url, false, false, NULL, &sink);
+  download_mgr.Fetch(&info);
+
+  EXPECT_EQ(kFailProxyConnection, info.error_code());
+  // Strictly more attempts than the nominal single retry: that extra is the
+  // cheap-failure budget in CanRetry(), not the max_retries allowance.
+  EXPECT_GT(static_cast<int>(info.num_retries()), 1)
+      << "a refused connect was written off after the nominal retry budget";
+}
+
+
 TEST_F(T_Download, RemoteFileProxyRedirect) {
   string src_path = GetSmallFile();
   string src_content = GetFileContents(src_path);
