@@ -21,6 +21,7 @@
 #include "util/file_guard.h"
 #include "util/posix.h"
 #include "util/prng.h"
+#include "util/smalloc.h"
 
 using namespace std;  // NOLINT
 
@@ -381,6 +382,41 @@ TEST_F(T_Download, RemoteFileSwitchProxies) {
   ASSERT_EQ(memsink.pos(), src_content.length());
   EXPECT_STREQ(reinterpret_cast<char *>(memsink.data()), src_content.c_str());
 }
+
+TEST_F(T_Download, WatchFdsShrinkBackToFloor) {
+  // After a burst of parallel transfers the poll array has to come back down.
+  // The shrink guard used to test watch_fds_inuse_ against watch_fds_max_,
+  // which is the wrong variable: the array only shrank while it was still
+  // heavily used, so it stayed at its peak size once the burst was over.
+  download_mgr.watch_fds_ = static_cast<struct pollfd *>(
+      smalloc(2 * sizeof(struct pollfd)));
+  download_mgr.watch_fds_size_ = 2;
+  download_mgr.watch_fds_inuse_ = 2;  // the two control pipes
+  download_mgr.watch_fds_[0].fd = -1;
+  download_mgr.watch_fds_[1].fd = -2;
+
+  const unsigned n = download_mgr.watch_fds_max_ * 2 + 1;
+  for (unsigned i = 0; i < n; ++i) {
+    DownloadManager::CallbackCurlSocket(NULL,
+                                        static_cast<curl_socket_t>(100 + i),
+                                        CURL_POLL_IN, &download_mgr, NULL);
+  }
+  EXPECT_GT(download_mgr.watch_fds_size_, download_mgr.watch_fds_max_);
+
+  for (unsigned i = 0; i < n; ++i) {
+    DownloadManager::CallbackCurlSocket(NULL,
+                                        static_cast<curl_socket_t>(100 + i),
+                                        CURL_POLL_REMOVE, &download_mgr, NULL);
+  }
+  EXPECT_EQ(2U, download_mgr.watch_fds_inuse_);
+  EXPECT_LE(download_mgr.watch_fds_size_, download_mgr.watch_fds_max_);
+
+  free(download_mgr.watch_fds_);
+  download_mgr.watch_fds_ = NULL;
+  download_mgr.watch_fds_size_ = 0;
+  download_mgr.watch_fds_inuse_ = 0;
+}
+
 
 TEST_F(T_Download, RemoteFileEmpty) {
   string src_path = GetEmptyFile();

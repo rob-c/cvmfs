@@ -507,8 +507,11 @@ int DownloadManager::CallbackCurlSocket(CURL * /* easy */,
                                       [download_mgr->watch_fds_inuse_ - 1];
       }
       download_mgr->watch_fds_inuse_--;
-      // Shrink array if necessary
-      if ((download_mgr->watch_fds_inuse_ > download_mgr->watch_fds_max_)
+      // Shrink array if necessary.  watch_fds_max_ is the floor for the
+      // allocation, so the test is on the array size, not on how much of it
+      // is in use: comparing watch_fds_inuse_ meant the array only shrank
+      // while still heavily used, and after a burst it stayed at its peak.
+      if ((download_mgr->watch_fds_size_ > download_mgr->watch_fds_max_)
           && (download_mgr->watch_fds_inuse_
               < download_mgr->watch_fds_size_ / 2)) {
         download_mgr->watch_fds_size_ /= 2;

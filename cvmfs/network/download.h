@@ -316,6 +316,7 @@ class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
 
   std::unique_ptr<Pipe<kPipeDownloadJobs> > pipe_jobs_;
   struct pollfd *watch_fds_;
+  FRIEND_TEST(T_Download, WatchFdsShrinkBackToFloor);
   uint32_t watch_fds_size_;
   uint32_t watch_fds_inuse_;
   uint32_t watch_fds_max_;
