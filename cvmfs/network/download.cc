@@ -1156,8 +1156,17 @@ void DownloadManager::SetUrlOptions(JobInfo *info) {
       if (opt_proxy_groups_current_ >= opt_proxy_groups_fallback_) {
         // It doesn't make sense to use the fallback proxies in Geo-API requests
         // since the fallback proxies are supposed to get sorted, too.
-        info->SetProxy("DIRECT");
-        curl_easy_setopt(info->curl_handle(), CURLOPT_PROXY, "");
+        // Dropping to an unproxied request to achieve that is only acceptable
+        // where direct connections are acceptable at all.  This branch is
+        // reached exactly while the local proxy is being failed over, so an
+        // unconditional switch here put the Geo-API query on the wire
+        // unproxied at the one moment a proxy-only site can least afford it.
+        // The query still goes out, through whichever proxy is current; only
+        // the cache-key template falls back to the direct form.
+        if (!opt_proxy_mandatory_) {
+          info->SetProxy("DIRECT");
+          curl_easy_setopt(info->curl_handle(), CURLOPT_PROXY, "");
+        }
         replacement = proxy_template_direct_;
       } else {
         replacement = ChooseProxyUnlocked(info->expected_hash())->host.name();
