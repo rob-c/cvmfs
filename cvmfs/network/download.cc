@@ -145,13 +145,20 @@ static size_t CallbackCurlHeader(void *ptr, size_t size, size_t nmemb,
   //          header_line.c_str());
 
   // Check http status codes
-  if (HasPrefix(header_line, "HTTP/1.", false)) {
-    if (header_line.length() < 10) {
+  if (HasPrefix(header_line, "HTTP/", false)) {
+    // The status code follows the version token.  That token is "1.1" or
+    // "1.0", but also a bare "2" or "3", so it has no fixed width: locate the
+    // code after the first space rather than at a hard-coded offset.  Assuming
+    // "HTTP/1." left http_code at -1 for every HTTP/2 reply, which suppressed
+    // the error handling below.
+    const size_t pos_code = header_line.find(' ');
+    if (pos_code == string::npos) {
       return 0;
     }
 
     unsigned i;
-    for (i = 8; (i < header_line.length()) && (header_line[i] == ' '); ++i) {
+    for (i = pos_code; (i < header_line.length()) && (header_line[i] == ' ');
+         ++i) {
     }
 
     // Code is initialized to -1

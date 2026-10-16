@@ -519,6 +519,75 @@ TEST_F(T_Download, ValidateGeoReply) {
 }
 
 
+namespace {
+// Replies with a caller-chosen protocol token so the client's status-line
+// parser can be exercised for versions other than HTTP/1.x.
+const char *g_status_line_protocol = "HTTP/1.1";
+int g_status_line_code = 200;
+
+HTTPResponse StatusLineHandler(const HTTPRequest & /* req */, void *data) {
+  int *hits = static_cast<int *>(data);
+  if (hits)
+    (*hits)++;
+  HTTPResponse response;
+  response.protocol = g_status_line_protocol;
+  response.code = g_status_line_code;
+  response.reason = (g_status_line_code == 200) ? "OK" : "Not Found";
+  response.body = "payload";
+  return response;
+}
+}  // namespace
+
+
+TEST_F(T_Download, HttpStatusLineAnyVersion) {
+  // An HTTP/2 status line carries a bare "2" as its version token, so the
+  // status code does not sit at the fixed offset an "HTTP/1." reply puts it
+  // at.  Missing it left http_code at -1 and silently skipped the error
+  // handling, so a 404 looked like a successful transfer.
+  int hits = 0;
+  MockHTTPServer server(8102);
+  ASSERT_TRUE(server.SetResponseCallback(StatusLineHandler, &hits));
+  ASSERT_TRUE(server.Start());
+
+  download_mgr.SetProxyChain("DIRECT", "", DownloadManager::kSetProxyBoth);
+  const string url = "http://127.0.0.1:8102/any";
+
+  // Baseline: HTTP/1.1 is parsed, as it always was.
+  g_status_line_protocol = "HTTP/1.1";
+  g_status_line_code = 404;
+  {
+    cvmfs::MemSink sink;
+    JobInfo info(&url, false, false, NULL, &sink);
+    download_mgr.Fetch(&info);
+    EXPECT_EQ(404, info.http_code());
+    EXPECT_NE(kFailOk, info.error_code());
+  }
+
+  // The regression: the same code announced over HTTP/2 must be seen too.
+  g_status_line_protocol = "HTTP/2";
+  g_status_line_code = 404;
+  {
+    cvmfs::MemSink sink;
+    JobInfo info(&url, false, false, NULL, &sink);
+    download_mgr.Fetch(&info);
+    EXPECT_EQ(404, info.http_code());
+    EXPECT_NE(kFailOk, info.error_code());
+  }
+
+  // And a successful HTTP/2 reply still has to be recognised as 2xx.
+  g_status_line_protocol = "HTTP/2";
+  g_status_line_code = 200;
+  {
+    cvmfs::MemSink sink;
+    JobInfo info(&url, false, false, NULL, &sink);
+    download_mgr.Fetch(&info);
+    EXPECT_EQ(200, info.http_code());
+    EXPECT_EQ(kFailOk, info.error_code());
+  }
+  server.Stop();
+}
+
+
 TEST_F(T_Download, ParseHttpCode) {
   char digits[3];
   digits[0] = '0';
