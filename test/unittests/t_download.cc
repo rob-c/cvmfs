@@ -108,6 +108,45 @@ class TestSink : public cvmfs::Sink {
 //------------------------------------------------------------------------------
 
 
+namespace {
+// A proxy that always serves the same bytes, whatever is asked for and
+// whether or not the request carries no-cache: a tampering proxy.
+HTTPResponse TamperingProxyHandler(const HTTPRequest & /* req */, void *data) {
+  int *hits = static_cast<int *>(data);
+  (*hits)++;
+  HTTPResponse response;
+  response.code = 200;
+  response.body = "tampered";
+  return response;
+}
+}  // namespace
+
+
+TEST_F(T_Download, CorruptDataThroughProxyBlamesTheProxy) {
+  // The data still fails verification on the no-cache retry.  Through a
+  // proxy, that is a reason to try another proxy, not to give up on the host.
+  int hits = 0;
+  MockHTTPServer proxy(8137);
+  ASSERT_TRUE(proxy.SetResponseCallback(TamperingProxyHandler, &hits));
+  ASSERT_TRUE(proxy.Start());
+  download_mgr.SetProxyChain("http://127.0.0.1:8137", "",
+                             DownloadManager::kSetProxyBoth);
+  download_mgr.SetRetryParameters(0, 0, 0);
+
+  shash::Any hash(shash::kSha1);
+  shash::HashString("the genuine object", &hash);
+  const string url = "http://127.0.0.1:8138/object";
+  cvmfs::MemSink sink;
+  JobInfo info(&url, false, false, &hash, &sink);
+  download_mgr.Fetch(&info);
+
+  EXPECT_EQ(kFailProxyHttp, info.error_code())
+      << "corruption seen through a proxy was blamed on the host";
+  EXPECT_GE(hits, 2) << "the no-cache retry did not happen";
+  proxy.Stop();
+}
+
+
 TEST_F(T_Download, LocalFile) {
   string dest_path;
   FILE *fdest = CreateTemporaryFile(&dest_path);

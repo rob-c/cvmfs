@@ -1597,13 +1597,19 @@ bool DownloadManager::VerifyAndFinalize(const int curl_error, JobInfo *info) {
       if (!info->nocache()) {
         try_again = true;
       } else {
-        // Make it a host failure
+        // Make it a host failure, or a proxy failure if a proxy is in the
+        // path: with the no-cache retry also corrupt, a tampering proxy (or
+        // middlebox on the proxy path) is at least as likely as a bad host,
+        // and only a proxy switch can route around it.  If all proxies fail
+        // the same way, the regular proxy-to-host fail-over still follows.
         LogCvmfs(kLogDownload, kLogDebug | kLogSyslogWarn,
                  "(manager '%s' - id %" PRId64 ") "
                  "data corruption with no-cache header, try another %s",
-                 name_.c_str(), info->id(), typ.c_str());
+                 name_.c_str(), info->id(),
+                 (info->proxy() == "DIRECT") ? typ.c_str() : "proxy");
 
-        info->SetErrorCode(kFailHostHttp);
+        info->SetErrorCode((info->proxy() == "DIRECT") ? kFailHostHttp
+                                                       : kFailProxyHttp);
       }
     }
     if (same_url_retry
