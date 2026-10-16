@@ -66,6 +66,7 @@
 #include "cache_stream.h"
 #include "catalog_mgr.h"
 #include "catalog_mgr_client.h"
+#include "chunk_readahead.h"
 #include "clientctx.h"
 #include "compat.h"
 #include "compression/compression.h"
@@ -126,6 +127,8 @@ TalkManager *talk_mgr_ = NULL;
 NotificationClient *notification_client_ = NULL;
 Watchdog *watchdog_ = NULL;
 FuseRemounter *fuse_remounter_ = NULL;
+
+ChunkReadahead *chunk_readahead_ = NULL;
 InodeGenerationInfo inode_generation_info_;
 #endif  // __TEST_CVMFS_MOCKFUSE
 
@@ -1529,6 +1532,14 @@ static void cvmfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
         if (chunks.external_data) {
           label.flags |= CacheManager::kLabelExternal;
           label.range_offset = chunks.list->AtPtr(chunk_idx)->offset();
+        } else if (chunk_readahead_ != NULL) {
+          // Only for cached chunks: external data is ranged out of a remote
+          // file and has no separate objects to prefetch.  Start at the chunk
+          // after the one about to be fetched, so the read-ahead runs ahead of
+          // the reader rather than duplicating its work.
+          chunk_readahead_->Schedule(
+              chunks, chunk_idx + 1, this_fetcher,
+              mount_point_->catalog_mgr()->volatile_flag());
         }
         chunk_fd.fd = this_fetcher->Fetch(CacheManager::LabeledObject(
             chunks.list->AtPtr(chunk_idx)->content_hash(), label));
@@ -2543,6 +2554,23 @@ static int Init(const loader::LoaderExports *loader_exports) {
       cvmfs::mount_point_, &cvmfs::inode_generation_info_, fuse_session,
       fuse_notify_invalidation);
 
+  // CVMFS_CHUNK_READAHEAD is how many chunks ahead of the reader to prefetch;
+  // zero, the default, leaves the pointer NULL and the feature off.  The
+  // worker count is capped at eight because the point is to fill the link with
+  // a handful of parallel streams, and beyond that the threads compete for the
+  // same proxy and cache without adding throughput.
+  unsigned chunk_readahead = 0;
+  if (cvmfs::options_mgr_->GetValue("CVMFS_CHUNK_READAHEAD", &buf)) {
+    // Bound before narrowing: a huge or negative value would otherwise wrap
+    // to a depth Schedule() can never satisfy while still spawning workers.
+    const uint64_t depth = String2Uint64(buf);
+    chunk_readahead = static_cast<unsigned>(std::min<uint64_t>(depth, 64));
+  }
+  if (chunk_readahead > 0) {
+    cvmfs::chunk_readahead_ = new cvmfs::ChunkReadahead(
+        chunk_readahead, std::min(chunk_readahead, 8U));
+  }
+
   // Control & command interface
   cvmfs::talk_mgr_ = TalkManager::Create(
       cvmfs::mount_point_->talk_socket_path(),
@@ -2640,6 +2668,8 @@ static void Spawn() {
 
   cvmfs::mount_point_->download_mgr()->Spawn();
   cvmfs::mount_point_->external_download_mgr()->Spawn();
+  if (cvmfs::chunk_readahead_ != NULL)
+    cvmfs::chunk_readahead_->Spawn();
   if (cvmfs::mount_point_->full_replica_download_mgr() != NULL)
     cvmfs::mount_point_->full_replica_download_mgr()->Spawn();
   if (cvmfs::mount_point_->resolv_conf_watcher() != NULL) {
@@ -2700,6 +2730,11 @@ static void ShutdownMountpoint() {
   // The remounter has a reference to the mount point and the inode generation
   delete cvmfs::fuse_remounter_;
   cvmfs::fuse_remounter_ = NULL;
+  // Before mount_point_ and file_system_ below: the destructor joins the
+  // read-ahead workers, and until they have stopped they may still be inside
+  // a fetch that uses both.
+  delete cvmfs::chunk_readahead_;
+  cvmfs::chunk_readahead_ = NULL;
 
   // The unpin listener requires the catalog, so this must be unregistered
   // before the catalog manager is removed
