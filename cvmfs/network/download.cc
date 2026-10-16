@@ -1148,7 +1148,8 @@ void DownloadManager::SetUrlOptions(JobInfo *info) {
         curl_easy_setopt(info->curl_handle(), CURLOPT_PROXY, "");
         replacement = proxy_template_direct_;
       } else {
-        replacement = ChooseProxyUnlocked(info->expected_hash())->host.name();
+        const ProxyInfo *proxy = ChooseProxyUnlocked(info->expected_hash());
+        replacement = proxy ? proxy->host.name() : proxy_template_direct_;
       }
     }
     replacement = (replacement == "") ? proxy_template_direct_ : replacement;
@@ -2386,6 +2387,12 @@ void DownloadManager::SwitchProxy(JobInfo *info) {
 
   // Fail any matching proxies within the current load-balancing group
   vector<ProxyInfo> *group = current_proxy_group();
+  // An empty group would make the group_size - burned subtraction below
+  // underflow and index off the end of the vector.
+  if ((group == NULL) || group->empty()
+      || (opt_proxy_groups_current_burned_ > group->size())) {
+    return;
+  }
   const unsigned group_size = group->size();
   unsigned failed = 0;
   for (unsigned i = 0; i < group_size - opt_proxy_groups_current_burned_; ++i) {
@@ -3077,6 +3084,8 @@ DownloadManager::ProxyInfo *DownloadManager::ChooseProxyUnlocked(
   const uint32_t key = (hash ? hash->Partial32() : 0);
   const map<uint32_t, ProxyInfo *>::iterator it = opt_proxy_map_.lower_bound(
       key);
+  if (it == opt_proxy_map_.end())
+    return NULL;
   ProxyInfo *proxy = it->second;
 
   return proxy;
@@ -3091,6 +3100,16 @@ void DownloadManager::UpdateProxiesUnlocked(const string &reason) {
 
   // Identify number of non-burned proxies within the current group
   vector<ProxyInfo> *group = current_proxy_group();
+  // Nothing selectable: either no chain is installed or every proxy in the
+  // current group is burned.  Both would otherwise reach prng_.Next(0) and
+  // index an empty vector below.  The map holds ProxyInfo pointers into the
+  // group, so the previous selection must not survive either.
+  if ((group == NULL) || group->empty()
+      || (opt_proxy_groups_current_burned_ >= group->size())) {
+    opt_proxy_map_.clear();
+    opt_proxies_.clear();
+    return;
+  }
   const unsigned num_alive = (group->size() - opt_proxy_groups_current_burned_);
   const string old_proxy = JoinStrings(opt_proxies_, "|");
 
@@ -3116,6 +3135,8 @@ void DownloadManager::UpdateProxiesUnlocked(const string &reason) {
       opt_proxies_.push_back(proxy->url + proxy_name);
     }
     // Ensure lower_bound() finds a value for all keys
+    if (opt_proxy_map_.empty())
+      return;
     ProxyInfo *first_proxy = opt_proxy_map_.begin()->second;
     const std::pair<uint32_t, ProxyInfo *> last_entry(max_key, first_proxy);
     opt_proxy_map_.insert(last_entry);

@@ -306,6 +306,7 @@ class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
   std::set<CURL *> *pool_handles_inuse_;
   uint32_t pool_max_handles_;
   CURLM *curl_multi_;
+  FRIEND_TEST(T_Download, NoProxyChainIsNotSelectable);
   HeaderLists *header_lists_;
   curl_slist *default_headers_;
   char *user_agent_;

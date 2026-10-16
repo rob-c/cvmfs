@@ -337,6 +337,35 @@ TEST_F(T_Download, CancelRequest) {
   EXPECT_EQ(NULL, memsink.data());
 }
 
+TEST_F(T_Download, NoProxyChainIsNotSelectable) {
+  // The selection helpers must cope with a manager that has nothing left to
+  // select rather than dividing by zero or dereferencing an empty map.
+  download_mgr.SetProxyChain("", "", DownloadManager::kSetProxyBoth);
+  EXPECT_TRUE(download_mgr.ChooseProxyUnlocked(NULL) == NULL);
+  download_mgr.RebalanceProxies();
+  download_mgr.SwitchProxyGroup();
+  EXPECT_TRUE(download_mgr.ChooseProxyUnlocked(NULL) == NULL);
+
+  // A group whose every member is burned: rebuilding the selection used to
+  // reach prng_.Next(0), a modulo by zero.
+  download_mgr.SetProxyChain("http://127.0.0.1:3128", "",
+                             DownloadManager::kSetProxyBoth);
+  download_mgr.opt_proxy_groups_current_burned_ = 1;
+  download_mgr.UpdateProxiesUnlocked("test");
+  EXPECT_TRUE(download_mgr.ChooseProxyUnlocked(NULL) == NULL);
+
+  // The same with sharding, which used to read begin() of an empty map.
+  download_mgr.ShardProxies();
+  download_mgr.opt_proxy_groups_current_burned_ = 1;
+  download_mgr.UpdateProxiesUnlocked("test");
+  EXPECT_TRUE(download_mgr.ChooseProxyUnlocked(NULL) == NULL);
+
+  // And once the group is reset, selection works again.
+  download_mgr.RebalanceProxies();
+  EXPECT_TRUE(download_mgr.ChooseProxyUnlocked(NULL) != NULL);
+}
+
+
 TEST_F(T_Download, RemoteFileSwitchHostsAfterRedirect) {
   string src_path = GetSmallFile();
   string src_content = GetFileContents(src_path);
