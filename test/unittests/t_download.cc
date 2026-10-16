@@ -202,6 +202,30 @@ TEST_F(T_Download, Multiple) {
 }
 
 
+TEST_F(T_Download, CutTransferRetriesPromptly) {
+  // A transfer that was cut short is a symptom of a lossy or meddling link,
+  // not of an overloaded server, so it is retried after a short jitter rather
+  // than the exponential backoff meant for overload.  With the stock
+  // CVMFS_BACKOFF_INIT of several seconds, every cut cost seconds of waiting.
+  const string url = "http://127.0.0.1:8136/object";
+  cvmfs::MemSink sink;
+  download_mgr.SetRetryParameters(3, 5000, 10000);
+  download_mgr.prng_.InitSeed(1);  // the exponential path would wait ~2 s
+
+  JobInfo cut(&url, false, false, NULL, &sink);
+  cut.SetErrorCode(kFailHostShortTransfer);
+  download_mgr.Backoff(&cut);
+  EXPECT_GE(cut.backoff_ms(), 10U);
+  EXPECT_LT(cut.backoff_ms(), 100U);
+  EXPECT_EQ(1U, cut.num_retries()) << "a prompt retry is still a retry";
+
+  JobInfo proxy_cut(&url, false, false, NULL, &sink);
+  proxy_cut.SetErrorCode(kFailProxyShortTransfer);
+  download_mgr.Backoff(&proxy_cut);
+  EXPECT_LT(proxy_cut.backoff_ms(), 100U);
+}
+
+
 TEST_F(T_Download, RemoteFile2Mem) {
   string src_path = GetSmallFile();
   string src_content = GetFileContents(src_path);

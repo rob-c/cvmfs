@@ -1302,7 +1302,12 @@ void DownloadManager::Backoff(JobInfo *info) {
 
   info->SetNumRetries(info->num_retries() + 1);
   perf::Inc(counters_->n_retries);
-  if (info->backoff_ms() == 0) {
+  if ((info->error_code() == kFailHostShortTransfer)
+      || (info->error_code() == kFailProxyShortTransfer)) {
+    // A cut stream is a lossy link, not an overloaded server: retry promptly
+    // with a small jitter instead of the exponential backoff
+    info->SetBackoffMs(10 + prng_.Next(90));
+  } else if (info->backoff_ms() == 0) {
     info->SetBackoffMs(prng_.Next(backoff_init_ms + 1));  // Must be != 0
   } else {
     info->SetBackoffMs(info->backoff_ms() * 2);
